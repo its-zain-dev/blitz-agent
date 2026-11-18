@@ -4,13 +4,38 @@ use std::fmt;
 use std::time::Instant;
 
 use anyhow::{bail, Result};
+use tokio::sync::mpsc;
 
-use crate::exec::{ExecReport, Executor};
+use crate::config::GuessMode;
+use crate::exec::{ExecEvent, ExecReport, Executor};
 use crate::llm::{LlmClient, Message};
 use crate::plan::{Limits, Plan};
-use crate::prompt::system_prompt;
+use crate::prompt::system_prompt_with;
 use crate::tools::TOOL_NAMES;
 use crate::util::truncate_chars;
+
+/// Live events emitted by the agent loop (consumed by the TUI).
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    TurnStarted {
+        turn: usize,
+        max_turns: usize,
+        model: String,
+    },
+    Thought(String),
+    PlanReady {
+        steps: usize,
+        total_nodes: usize,
+    },
+    Exec(ExecEvent),
+    TurnReport {
+        turn: usize,
+        report: ExecReport,
+        stats: Stats,
+    },
+    ParseError(String),
+    OptimisticFinish,
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -18,8 +43,11 @@ pub struct AgentConfig {
     /// Max bytes of each tool's output that is shown to the model.
     pub max_output: usize,
     pub limits: Limits,
+    pub guess_mode: GuessMode,
+    pub optimistic_finish: bool,
     /// Print progress to stderr.
     pub verbose: bool,
+    pub events: Option<mpsc::UnboundedSender<AgentEvent>>,
 }
 
 impl Default for AgentConfig {
@@ -28,7 +56,10 @@ impl Default for AgentConfig {
             max_turns: 30,
             max_output: 8000,
             limits: Limits::default(),
+            guess_mode: GuessMode::Aggressive,
+            optimistic_finish: true,
             verbose: false,
+            events: None,
         }
     }
 }
@@ -49,13 +80,30 @@ pub struct Stats {
     pub tool_ms: u64,
 }
 
-impl fmt::Display for Stats {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let parallel_gain = if self.exec_wall_ms > 0 {
-            self.tool_ms as f64 / self.exec_wall_ms as f64
+impl Stats {
+    pub fn merge(&mut self, other: &Stats) {
+        self.llm_turns += other.llm_turns;
+        self.tool_calls += other.tool_calls;
+        self.chained += other.chained;
+        self.hits += other.hits;
+        self.misses += other.misses;
+        self.parse_errors += other.parse_errors;
+        self.llm_ms += other.llm_ms;
+        self.exec_wall_ms += other.exec_wall_ms;
+        self.tool_ms += other.tool_ms;
+    }
+
+    pub fn parallel_speedup(&self) -> f64 {
+        if self.exec_wall_ms > 0 {
+            (self.tool_ms as f64 / self.exec_wall_ms as f64).max(1.0)
         } else {
             1.0
-        };
+        }
+    }
+}
+
+impl fmt::Display for Stats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "turns: {} | tool calls: {} | auto-chained: {} | predictions: {} hit / {} miss | \
@@ -69,7 +117,7 @@ impl fmt::Display for Stats {
             self.llm_ms as f64 / 1000.0,
             self.exec_wall_ms as f64 / 1000.0,
             self.tool_ms as f64 / 1000.0,
-            parallel_gain
+            self.parallel_speedup()
         )
     }
 }
@@ -98,13 +146,32 @@ impl Agent {
         }
     }
 
+    fn emit(&self, ev: AgentEvent) {
+        if let Some(tx) = &self.cfg.events {
+            let _ = tx.send(ev);
+        }
+    }
+
     pub async fn run(&self, task: &str) -> Result<RunResult> {
-        let system = system_prompt(self.cfg.limits.max_depth);
-        let mut msgs = vec![Message::user(format!(
-            "TASK:\n{task}\n\nWorking directory: {}\nOS: {}\nRespond with your first JSON plan.",
+        let mut msgs = Vec::new();
+        self.run_with_history(task, &mut msgs).await
+    }
+
+    pub async fn run_with_history(
+        &self,
+        task: &str,
+        msgs: &mut Vec<Message>,
+    ) -> Result<RunResult> {
+        let system = system_prompt_with(
+            self.cfg.guess_mode,
+            self.cfg.limits,
+            self.cfg.optimistic_finish,
+        );
+        msgs.push(Message::user(format!(
+            "TASK:\n{task}\n\nWorking directory: {}\nOS: {}\nRespond with your JSON plan.",
             self.exec.tools.workdir.display(),
             std::env::consts::OS
-        ))];
+        )));
         let mut stats = Stats::default();
         let mut consecutive_errors = 0usize;
 
@@ -113,8 +180,13 @@ impl Agent {
                 "\n━━ turn {turn} ━━ asking {} ...",
                 self.llm.model()
             ));
+            self.emit(AgentEvent::TurnStarted {
+                turn,
+                max_turns: self.cfg.max_turns,
+                model: self.llm.model().to_string(),
+            });
             let t0 = Instant::now();
-            let reply = self.llm.complete(&system, &msgs).await?;
+            let reply = self.llm.complete(&system, msgs).await?;
             stats.llm_turns += 1;
             stats.llm_ms += t0.elapsed().as_millis() as u64;
             msgs.push(Message::assistant(reply.clone()));
@@ -132,6 +204,7 @@ impl Agent {
                     stats.parse_errors += 1;
                     consecutive_errors += 1;
                     self.log(format!("⚠ invalid plan: {e}"));
+                    self.emit(AgentEvent::ParseError(e.clone()));
                     if consecutive_errors >= 3 {
                         bail!("model produced an invalid plan 3 times in a row: {e}");
                     }
@@ -144,6 +217,7 @@ impl Agent {
 
             if let Some(t) = &plan.thought {
                 self.log(format!("💭 {}", truncate_chars(t, 300)));
+                self.emit(AgentEvent::Thought(t.clone()));
             }
             if plan.steps.is_empty() {
                 if let Some(f) = plan.finish {
@@ -154,12 +228,31 @@ impl Agent {
                 }
             }
 
+            let total_nodes = plan.node_count();
             self.log(format!(
                 "⚡ executing {} step(s) in parallel ({} node(s) incl. predictions)",
                 plan.steps.len(),
-                plan.node_count()
+                total_nodes
             ));
-            let report = self.exec.run(&plan.steps).await;
+            self.emit(AgentEvent::PlanReady {
+                steps: plan.steps.len(),
+                total_nodes,
+            });
+
+            let exec = if let Some(agent_tx) = &self.cfg.events {
+                let (exec_tx, mut exec_rx) = mpsc::unbounded_channel();
+                let forward_tx = agent_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(ev) = exec_rx.recv().await {
+                        let _ = forward_tx.send(AgentEvent::Exec(ev));
+                    }
+                });
+                self.exec.clone().with_events(exec_tx)
+            } else {
+                self.exec.clone()
+            };
+
+            let report = exec.run(&plan.steps).await;
             stats.tool_calls += report.tool_calls();
             stats.chained += report.chained();
             stats.hits += report.hits();
@@ -169,12 +262,22 @@ impl Agent {
             for r in &report.records {
                 self.log(format!("  {}", ExecReport::summary_line(r)));
             }
+            self.emit(AgentEvent::TurnReport {
+                turn,
+                report: report.clone(),
+                stats: stats.clone(),
+            });
 
             let clean = report.clean();
-            let finish = report.finish.clone().or_else(|| plan.finish.clone());
+            let finish = if self.cfg.optimistic_finish {
+                report.finish.clone().or_else(|| plan.finish.clone())
+            } else {
+                None
+            };
             if clean {
                 if let Some(f) = finish {
                     self.log("🏁 predictions held – finishing without another round trip");
+                    self.emit(AgentEvent::OptimisticFinish);
                     return Ok(RunResult {
                         answer: Some(f),
                         stats,
@@ -183,7 +286,7 @@ impl Agent {
             }
 
             let mut feedback = report.render(self.cfg.max_output);
-            if finish.is_some() && !clean {
+            if (report.finish.is_some() || plan.finish.is_some()) && !clean {
                 feedback.push_str(
                     "\nNOTE: a finish was requested but NOT accepted because a prediction missed \
                      or an un-predicted step failed. Review the results above.\n",

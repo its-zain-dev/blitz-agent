@@ -54,7 +54,8 @@ fn enforces_depth_and_node_limits() {
         deep,
         Limits {
             max_depth: 3,
-            max_nodes: 64
+            max_nodes: 64,
+            max_branches: 5,
         }
     )
     .is_ok());
@@ -63,6 +64,7 @@ fn enforces_depth_and_node_limits() {
         Limits {
             max_depth: 2,
             max_nodes: 64,
+            max_branches: 5,
         },
     )
     .unwrap_err();
@@ -72,6 +74,7 @@ fn enforces_depth_and_node_limits() {
         Limits {
             max_depth: 9,
             max_nodes: 2,
+            max_branches: 5,
         },
     )
     .unwrap_err();

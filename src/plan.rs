@@ -47,6 +47,8 @@ pub struct Limits {
     pub max_depth: usize,
     /// Maximum total nodes in one plan.
     pub max_nodes: usize,
+    /// Maximum prediction branches on a single node.
+    pub max_branches: usize,
 }
 
 impl Default for Limits {
@@ -54,6 +56,7 @@ impl Default for Limits {
         Self {
             max_depth: 4,
             max_nodes: 64,
+            max_branches: 5,
         }
     }
 }
@@ -130,6 +133,14 @@ fn check_node(
             label,
             n.tool,
             tools.join(", ")
+        ));
+    }
+    if n.predict.len() > limits.max_branches {
+        return Err(format!(
+            "node '{}': too many predict branches ({} > max {})",
+            label,
+            n.predict.len(),
+            limits.max_branches
         ));
     }
     for (i, b) in n.predict.iter().enumerate() {

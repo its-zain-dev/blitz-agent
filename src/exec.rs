@@ -3,13 +3,15 @@
 //! * All top-level steps run concurrently (bounded by a semaphore).
 //! * When a step finishes, its predicted branches are checked in order; the first
 //!   match spawns that branch's `then` nodes concurrently – no LLM round trip.
+//! * Predicted child nodes can reference parent/earlier outputs via `{{stdout:id}}`,
+//!   `{{stderr:id}}`, and `{{exit:id}}` placeholders in any string argument.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use futures::future::{join_all, BoxFuture, FutureExt};
 use serde_json::Value;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::plan::Node;
 use crate::tools::{ToolBox, ToolOutput};
@@ -36,6 +38,19 @@ pub struct NodeRecord {
     pub outcome: Outcome,
 }
 
+/// Live events emitted during plan execution (used by the TUI).
+#[derive(Debug, Clone)]
+pub enum ExecEvent {
+    NodeStarted {
+        id: String,
+        parent: Option<String>,
+        depth: usize,
+        tool: String,
+        args: Value,
+    },
+    NodeFinished(NodeRecord),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ExecReport {
     /// Records in completion order.
@@ -51,10 +66,50 @@ struct Shared {
     finish: Option<String>,
 }
 
+/// Replace `{{stdout:id}}`, `{{stderr:id}}`, `{{exit:id}}` in string values of `val`
+/// using completed `records`.
+fn interpolate_args(val: &Value, records: &[NodeRecord]) -> Value {
+    match val {
+        Value::String(s) => {
+            if !s.contains("{{") {
+                return Value::String(s.clone());
+            }
+            let mut out = s.clone();
+            for r in records {
+                let stdout_tag = format!("{{{{stdout:{}}}}}", r.id);
+                if out.contains(&stdout_tag) {
+                    out = out.replace(&stdout_tag, r.output.stdout.trim_end());
+                }
+                let stderr_tag = format!("{{{{stderr:{}}}}}", r.id);
+                if out.contains(&stderr_tag) {
+                    out = out.replace(&stderr_tag, r.output.stderr.trim_end());
+                }
+                let exit_tag = format!("{{{{exit:{}}}}}", r.id);
+                if out.contains(&exit_tag) {
+                    out = out.replace(&exit_tag, &r.output.exit_code.to_string());
+                }
+            }
+            Value::String(out)
+        }
+        Value::Array(arr) => Value::Array(
+            arr.iter()
+                .map(|v| interpolate_args(v, records))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), interpolate_args(v, records)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 #[derive(Clone)]
 pub struct Executor {
     pub tools: Arc<ToolBox>,
     sem: Arc<Semaphore>,
+    events: Option<mpsc::UnboundedSender<ExecEvent>>,
 }
 
 impl Executor {
@@ -62,7 +117,13 @@ impl Executor {
         Self {
             tools: Arc::new(tools),
             sem: Arc::new(Semaphore::new(concurrency.max(1))),
+            events: None,
         }
+    }
+
+    pub fn with_events(mut self, tx: mpsc::UnboundedSender<ExecEvent>) -> Self {
+        self.events = Some(tx);
+        self
     }
 
     /// Execute a set of top-level steps (and every predicted branch that hits).
@@ -91,9 +152,24 @@ impl Executor {
         shared: Arc<Mutex<Shared>>,
     ) -> BoxFuture<'static, ()> {
         async move {
+            let resolved_args = {
+                let s = shared.lock().unwrap();
+                interpolate_args(&node.args, &s.records)
+            };
+
+            if let Some(tx) = &self.events {
+                let _ = tx.send(ExecEvent::NodeStarted {
+                    id: node.id.clone(),
+                    parent: parent.clone(),
+                    depth,
+                    tool: node.tool.clone(),
+                    args: resolved_args.clone(),
+                });
+            }
+
             let output = {
                 let _permit = self.sem.acquire().await.expect("semaphore closed");
-                self.tools.call(&node.tool, &node.args).await
+                self.tools.call(&node.tool, &resolved_args).await
             };
 
             let mut outcome = if node.predict.is_empty() {
@@ -113,7 +189,15 @@ impl Executor {
                     if let Some(f) = &b.finish {
                         let mut s = shared.lock().unwrap();
                         if s.finish.is_none() {
-                            s.finish = Some(f.clone());
+                            let interpolated_finish =
+                                match interpolate_args(&Value::String(f.clone()), &s.records) {
+                                    Value::String(st) => st,
+                                    _ => f.clone(),
+                                };
+                            let stdout_self = format!("{{{{stdout:{}}}}}", node.id);
+                            let final_f = interpolated_finish
+                                .replace(&stdout_self, output.stdout.trim_end());
+                            s.finish = Some(final_f);
                         }
                     }
                     children = b.then.clone();
@@ -126,10 +210,13 @@ impl Executor {
                 parent,
                 depth,
                 tool: node.tool.clone(),
-                args: node.args.clone(),
+                args: resolved_args,
                 output,
                 outcome,
             };
+            if let Some(tx) = &self.events {
+                let _ = tx.send(ExecEvent::NodeFinished(record.clone()));
+            }
             shared.lock().unwrap().records.push(record);
 
             let parent_id = node.id.clone();

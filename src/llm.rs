@@ -1,12 +1,15 @@
 //! Minimal LLM clients: OpenAI-compatible, Google Gemini, Anthropic, plus a scripted mock.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::config::AppConfig;
 use crate::util::truncate_chars;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,12 +40,60 @@ impl Message {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum, Default,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
-    Openai,
+    #[default]
     Gemini,
+    Openai,
     Anthropic,
     Mock,
+}
+
+impl ProviderKind {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Gemini => Self::Openai,
+            Self::Openai => Self::Anthropic,
+            Self::Anthropic => Self::Gemini,
+            Self::Mock => Self::Gemini,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Gemini => Self::Anthropic,
+            Self::Openai => Self::Gemini,
+            Self::Anthropic => Self::Openai,
+            Self::Mock => Self::Gemini,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gemini => "Google Gemini",
+            Self::Openai => "OpenAI / Compatible",
+            Self::Anthropic => "Anthropic Claude",
+            Self::Mock => "Mock (Scripted)",
+        }
+    }
+
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::Gemini => "GEMINI",
+            Self::Openai => "OPENAI",
+            Self::Anthropic => "ANTHROPIC",
+            Self::Mock => "MOCK",
+        }
+    }
+}
+
+impl fmt::Display for ProviderKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.short())
+    }
 }
 
 struct ProviderDefaults {
@@ -87,23 +138,65 @@ pub struct LlmClient {
 }
 
 impl LlmClient {
-    /// Build a real provider client. API keys are read from the environment.
+    /// Build a client from `AppConfig`.
+    pub fn from_config(cfg: &AppConfig) -> Result<Self> {
+        Self::with_key(
+            cfg.provider,
+            Some(cfg.active_model().to_string()),
+            Some(cfg.active_api_key().to_string()),
+            Some(cfg.active_base_url().to_string()),
+            cfg.json_mode,
+        )
+    }
+
+    /// Build a real provider client. API keys are read from the environment or `AppConfig`.
     pub fn new(
         kind: ProviderKind,
         model: Option<String>,
         base_url: Option<String>,
         json_mode: bool,
     ) -> Result<Self> {
+        Self::with_key(kind, model, None, base_url, json_mode)
+    }
+
+    pub fn with_key(
+        kind: ProviderKind,
+        model: Option<String>,
+        explicit_key: Option<String>,
+        base_url: Option<String>,
+        json_mode: bool,
+    ) -> Result<Self> {
         let d = defaults(kind);
+        let saved = AppConfig::load();
         let api_key = if kind == ProviderKind::Mock {
             String::new()
         } else {
-            d.key_envs
-                .iter()
-                .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
-                .ok_or_else(|| anyhow!("missing API key: set {}", d.key_envs.join(" or ")))?
+            explicit_key
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| {
+                    d.key_envs
+                        .iter()
+                        .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+                })
+                .or_else(|| {
+                    let k = match kind {
+                        ProviderKind::Gemini => &saved.gemini_api_key,
+                        ProviderKind::Openai => &saved.openai_api_key,
+                        ProviderKind::Anthropic => &saved.anthropic_api_key,
+                        ProviderKind::Mock => "",
+                    };
+                    (!k.trim().is_empty()).then(|| k.to_string())
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "missing API key for {}: set {} or configure it in Settings (F2 / /settings)",
+                        kind.label(),
+                        d.key_envs.join(" or ")
+                    )
+                })?
         };
         let base_url = base_url
+            .filter(|u| !u.trim().is_empty())
             .or_else(|| {
                 if kind == ProviderKind::Openai {
                     std::env::var("OPENAI_BASE_URL").ok()
@@ -118,7 +211,9 @@ impl LlmClient {
             .context("building HTTP client")?;
         Ok(Self {
             kind,
-            model: model.unwrap_or_else(|| d.model.to_string()),
+            model: model
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| d.model.to_string()),
             api_key,
             base_url: base_url.trim_end_matches('/').to_string(),
             json_mode,

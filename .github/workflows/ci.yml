@@ -84,8 +84,8 @@ jobs:
         run: |
           cp target/release/blitz blitz-linux-x86_64
           cp target/aarch64-linux-android/release/blitz blitz-android-arm64
-          gh release view v0.1.0 >/dev/null 2>&1 || gh release create v0.1.0 --title "Blitz v0.1.0" --notes "Prebuilt binaries for Linux x86_64 and Android/Termux ARM64"
-          gh release upload v0.1.0 blitz-linux-x86_64 blitz-android-arm64 --clobber
+          gh release view v0.2.0 >/dev/null 2>&1 || gh release create v0.2.0 --title "Blitz v0.2.0 (TUI + Auto-Guessing)" --notes "Full TUI, interactive settings, {{stdout:id}} output chaining, and prebuilt binaries for Linux x86_64 and Android/Termux ARM64"
+          gh release upload v0.2.0 blitz-linux-x86_64 blitz-android-arm64 --clobber
 
   live:
     name: live LLM smoke test (${{ matrix.provider }})

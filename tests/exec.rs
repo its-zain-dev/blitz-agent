@@ -149,3 +149,25 @@ async fn render_truncates_long_output() {
     assert!(text.contains("bytes omitted"));
     assert!(text.len() < 4000);
 }
+
+#[tokio::test]
+async fn interpolates_stdout_in_predicted_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = plan(
+        r#"{"steps": [
+            {"id": "sys", "tool": "bash", "args": {"cmd": "echo KERNEL_42"},
+             "predict": [{"when": {"success": true}, "then": [
+                {"id": "save", "tool": "write_file",
+                 "args": {"path": "summary.md", "content": "Info: {{stdout:sys}}\n"},
+                 "predict": [{"when": {"success": true}, "then": [], "finish": "Saved {{stdout:sys}}"}]}
+             ]}]}
+        ]}"#,
+    );
+    let r = executor(dir.path(), 8).run(&p.steps).await;
+    assert!(r.clean());
+    assert_eq!(r.finish.as_deref(), Some("Saved KERNEL_42"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("summary.md")).unwrap(),
+        "Info: KERNEL_42\n"
+    );
+}
