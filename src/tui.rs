@@ -109,10 +109,7 @@ fn clean_tool_summary(tool: &str, args: &Value) -> String {
         "read_file" | "write_file" | "edit_file" | "list_dir" => {
             args.get("path").and_then(|v| v.as_str()).unwrap_or(".")
         }
-        "search" => args
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .unwrap_or(""),
+        "search" => args.get("pattern").and_then(|v| v.as_str()).unwrap_or(""),
         _ => "",
     };
     let single_line = raw.lines().next().unwrap_or("").trim();
@@ -381,9 +378,11 @@ impl TuiApp {
                 });
             }
             AgentEvent::Exec(ExecEvent::NodeFinished(rec)) => {
-                if let Some(pos) = self.entries.iter().rposition(|e| {
-                    matches!(e, ChatEntry::ToolRunning { id, .. } if *id == rec.id)
-                }) {
+                if let Some(pos) = self
+                    .entries
+                    .iter()
+                    .rposition(|e| matches!(e, ChatEntry::ToolRunning { id, .. } if *id == rec.id))
+                {
                     self.entries[pos] = ChatEntry::ToolDone(rec);
                 } else {
                     self.push_entry(ChatEntry::ToolDone(rec));
@@ -532,7 +531,11 @@ impl TuiApp {
                 self.show_tool_output = !self.show_tool_output;
                 self.push_entry(ChatEntry::Notice(format!(
                     "Tool stdout logs: {}",
-                    if self.show_tool_output { "shown" } else { "hidden" }
+                    if self.show_tool_output {
+                        "shown"
+                    } else {
+                        "hidden"
+                    }
                 )));
             }
             "/cancel" | "/stop" => self.cancel_running(),
@@ -963,10 +966,7 @@ impl TuiApp {
                     lines.push(Line::from(vec![
                         Span::raw(indent),
                         Span::styled(format!("{spinner} "), Style::default().fg(Color::Yellow)),
-                        Span::styled(
-                            format!("{tool} "),
-                            Style::default().fg(Color::Cyan),
-                        ),
+                        Span::styled(format!("{tool} "), Style::default().fg(Color::Cyan)),
                         Span::styled(
                             truncate_chars(summary, max_s),
                             Style::default().fg(Color::DarkGray),
@@ -996,10 +996,7 @@ impl TuiApp {
                         Span::raw(indent.clone()),
                         Span::styled(chain_tag, Style::default().fg(Color::Magenta)),
                         Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
-                        Span::styled(
-                            format!("{} ", r.tool),
-                            Style::default().fg(Color::Cyan),
-                        ),
+                        Span::styled(format!("{} ", r.tool), Style::default().fg(Color::Cyan)),
                         Span::styled(
                             format!("{} ", truncate_chars(&summary, max_s)),
                             Style::default().fg(Color::Gray),
@@ -1039,7 +1036,11 @@ impl TuiApp {
                     } else {
                         1.0
                     };
-                    let ff = if *fast_finish { " · instant finish" } else { "" };
+                    let ff = if *fast_finish {
+                        " · instant finish"
+                    } else {
+                        ""
+                    };
                     lines.push(Line::from(vec![Span::styled(
                         format!(
                             "  ⚡ {tools} tools ({chained} auto-chained) · {wall_ms}ms ({speedup:.1}x){ff}"
@@ -1158,14 +1159,8 @@ impl TuiApp {
         let rows: Vec<(&str, String)> = vec![
             ("Provider", format!("◀ {} ▶", self.cfg.provider.label())),
             ("Model", format!("◀ {} ▶", self.cfg.active_model())),
-            (
-                "Gemini Key",
-                AppConfig::mask_key(&self.cfg.gemini_api_key),
-            ),
-            (
-                "OpenAI Key",
-                AppConfig::mask_key(&self.cfg.openai_api_key),
-            ),
+            ("Gemini Key", AppConfig::mask_key(&self.cfg.gemini_api_key)),
+            ("OpenAI Key", AppConfig::mask_key(&self.cfg.openai_api_key)),
             (
                 "Anthropic Key",
                 AppConfig::mask_key(&self.cfg.anthropic_api_key),
@@ -1179,7 +1174,11 @@ impl TuiApp {
                 "Fast Finish",
                 format!(
                     "◀ {} ▶",
-                    if self.cfg.optimistic_finish { "ON" } else { "OFF" }
+                    if self.cfg.optimistic_finish {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
                 ),
             ),
             ("Concurrency", format!("◀ {}x ▶", self.cfg.concurrency)),

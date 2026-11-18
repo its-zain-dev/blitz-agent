@@ -276,9 +276,7 @@ async fn exec(a: ExecArgs) -> Result<i32> {
         ToolBox::new(workdir, Duration::from_secs(a.timeout_secs)),
         a.concurrency,
     );
-    let report = exec
-        .run_with_after_all(&plan.steps, &plan.after_all)
-        .await;
+    let report = exec.run_with_after_all(&plan.steps, &plan.after_all).await;
     for r in &report.records {
         eprintln!("{}", ExecReport::summary_line(r));
     }
