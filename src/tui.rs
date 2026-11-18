@@ -245,11 +245,11 @@ pub struct TuiApp {
 impl TuiApp {
     pub fn new(cfg: AppConfig, workdir: PathBuf) -> Self {
         let mut entries = vec![ChatEntry::Hero];
-        if cfg.active_api_key().trim().is_empty() {
+        if cfg.requires_api_key() && cfg.active_api_key().trim().is_empty() {
             entries.push(ChatEntry::SlashCmd {
                 cmd: "/status".into(),
                 result: format!(
-                    "No API key set for {}. Type /key YOUR_KEY or press F2 (/settings).",
+                    "No API key set for {}. Type /key YOUR_KEY, /provider agy, or press F2 (/settings).",
                     cfg.provider.label()
                 ),
             });
@@ -529,13 +529,14 @@ impl TuiApp {
                     self.cfg.provider = self.cfg.provider.next();
                 } else {
                     match arg.to_lowercase().as_str() {
+                        "agy" | "antigravity" => self.cfg.provider = ProviderKind::Agy,
                         "gemini" | "google" | "g" => self.cfg.provider = ProviderKind::Gemini,
                         "openai" | "o" => self.cfg.provider = ProviderKind::Openai,
                         "anthropic" | "claude" | "a" => self.cfg.provider = ProviderKind::Anthropic,
                         _ => {
                             self.push_entry(ChatEntry::SlashCmd {
                                 cmd: line.to_string(),
-                                result: "Usage: /provider <gemini|openai|anthropic>".into(),
+                                result: "Usage: /provider <agy|gemini|openai|anthropic>".into(),
                             });
                             return;
                         }
@@ -568,10 +569,18 @@ impl TuiApp {
                 });
             }
             "/key" | "/k" => {
-                if arg.is_empty() {
+                if !self.cfg.requires_api_key() {
+                    self.push_entry(ChatEntry::SlashCmd {
+                        cmd: "/key".into(),
+                        result: format!(
+                            "{} uses your logged-in `agy` CLI account (no API key required).",
+                            self.cfg.provider.label()
+                        ),
+                    });
+                } else if arg.is_empty() {
                     self.show_settings = true;
                     self.setting_idx = match self.cfg.provider {
-                        ProviderKind::Gemini | ProviderKind::Mock => 2,
+                        ProviderKind::Gemini | ProviderKind::Agy | ProviderKind::Mock => 2,
                         ProviderKind::Openai => 3,
                         ProviderKind::Anthropic => 4,
                     };
@@ -966,7 +975,9 @@ impl TuiApp {
         for entry in &self.entries {
             match entry {
                 ChatEntry::Hero => {
-                    let key_status = if self.cfg.active_api_key().trim().is_empty() {
+                    let key_status = if !self.cfg.requires_api_key() {
+                        "CLI Account Ready"
+                    } else if self.cfg.active_api_key().trim().is_empty() {
                         "No API Key · /settings"
                     } else {
                         "API Ready"
@@ -976,7 +987,7 @@ impl TuiApp {
                     lines.push(Line::from(vec![
                         Span::styled("      ▄▀▀▄        ", Style::default().fg(Color::Cyan)),
                         Span::styled(
-                            "Blitz CLI 0.3.0",
+                            "Blitz CLI 0.3.1",
                             Style::default()
                                 .fg(Color::White)
                                 .add_modifier(Modifier::BOLD),

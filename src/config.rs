@@ -74,6 +74,7 @@ impl fmt::Display for GuessMode {
 #[serde(default)]
 pub struct AppConfig {
     pub provider: ProviderKind,
+    pub agy_model: String,
     pub gemini_model: String,
     pub openai_model: String,
     pub anthropic_model: String,
@@ -98,7 +99,8 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            provider: ProviderKind::Gemini,
+            provider: ProviderKind::Agy,
+            agy_model: "gemini-4-argon-high".into(),
             gemini_model: "gemini-2.5-flash".into(),
             openai_model: "gpt-4.1-mini".into(),
             anthropic_model: "claude-sonnet-4-5".into(),
@@ -196,9 +198,15 @@ impl AppConfig {
         Ok(())
     }
 
+    /// Whether the active provider requires a user-supplied API key.
+    pub fn requires_api_key(&self) -> bool {
+        !matches!(self.provider, ProviderKind::Agy | ProviderKind::Mock)
+    }
+
     /// Currently active model name for the selected provider.
     pub fn active_model(&self) -> &str {
         match self.provider {
+            ProviderKind::Agy => &self.agy_model,
             ProviderKind::Gemini => &self.gemini_model,
             ProviderKind::Openai => &self.openai_model,
             ProviderKind::Anthropic => &self.anthropic_model,
@@ -212,6 +220,7 @@ impl AppConfig {
         }
         let m = model.trim().to_string();
         match self.provider {
+            ProviderKind::Agy => self.agy_model = m,
             ProviderKind::Gemini => self.gemini_model = m,
             ProviderKind::Openai => self.openai_model = m,
             ProviderKind::Anthropic => self.anthropic_model = m,
@@ -237,6 +246,25 @@ impl AppConfig {
 
     pub fn model_presets(provider: ProviderKind) -> &'static [&'static str] {
         match provider {
+            ProviderKind::Agy => &[
+                "gemini-4-argon-high",
+                "gemini-4-argon-medium",
+                "gemini-4-argon-low",
+                "gemini-4-neon-xhigh",
+                "gemini-4-neon-high",
+                "gemini-4-neon-medium",
+                "gemini-4-neon-low",
+                "gemini-4-hydrogen-high",
+                "gemini-4-hydrogen-low",
+                "gemini-3.8-flash-high",
+                "gemini-3.8-flash-medium",
+                "gemini-3.8-flash-low",
+                "claude-opus-5-5-high",
+                "claude-opus-5-5-medium",
+                "claude-sonnet-5-5-high",
+                "claude-sonnet-5-5-medium",
+                "gpt-oss-120b-medium",
+            ],
             ProviderKind::Gemini => &[
                 "gemini-2.5-flash",
                 "gemini-2.5-pro",
@@ -262,10 +290,10 @@ impl AppConfig {
 
     pub fn active_api_key(&self) -> &str {
         match self.provider {
+            ProviderKind::Agy | ProviderKind::Mock => "",
             ProviderKind::Gemini => &self.gemini_api_key,
             ProviderKind::Openai => &self.openai_api_key,
             ProviderKind::Anthropic => &self.anthropic_api_key,
-            ProviderKind::Mock => "",
         }
     }
 
@@ -275,12 +303,13 @@ impl AppConfig {
             ProviderKind::Gemini => self.gemini_api_key = k,
             ProviderKind::Openai => self.openai_api_key = k,
             ProviderKind::Anthropic => self.anthropic_api_key = k,
-            ProviderKind::Mock => {}
+            ProviderKind::Agy | ProviderKind::Mock => {}
         }
     }
 
     pub fn active_base_url(&self) -> &str {
         match self.provider {
+            ProviderKind::Agy => "(local agy CLI)",
             ProviderKind::Gemini => &self.gemini_base_url,
             ProviderKind::Openai => &self.openai_base_url,
             ProviderKind::Anthropic => &self.anthropic_base_url,
@@ -297,7 +326,7 @@ impl AppConfig {
             ProviderKind::Gemini => self.gemini_base_url = u,
             ProviderKind::Openai => self.openai_base_url = u,
             ProviderKind::Anthropic => self.anthropic_base_url = u,
-            ProviderKind::Mock => {}
+            ProviderKind::Agy | ProviderKind::Mock => {}
         }
     }
 
