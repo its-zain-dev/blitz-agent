@@ -91,11 +91,9 @@ fn interpolate_args(val: &Value, records: &[NodeRecord]) -> Value {
             }
             Value::String(out)
         }
-        Value::Array(arr) => Value::Array(
-            arr.iter()
-                .map(|v| interpolate_args(v, records))
-                .collect(),
-        ),
+        Value::Array(arr) => {
+            Value::Array(arr.iter().map(|v| interpolate_args(v, records)).collect())
+        }
         Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(k, v)| (k.clone(), interpolate_args(v, records)))
@@ -195,8 +193,8 @@ impl Executor {
                                     _ => f.clone(),
                                 };
                             let stdout_self = format!("{{{{stdout:{}}}}}", node.id);
-                            let final_f = interpolated_finish
-                                .replace(&stdout_self, output.stdout.trim_end());
+                            let final_f =
+                                interpolated_finish.replace(&stdout_self, output.stdout.trim_end());
                             s.finish = Some(final_f);
                         }
                     }

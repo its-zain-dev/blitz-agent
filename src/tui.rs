@@ -5,9 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -330,9 +328,11 @@ impl TuiApp {
                 });
             }
             AgentEvent::Exec(ExecEvent::NodeFinished(rec)) => {
-                if let Some(pos) = self.entries.iter().rposition(|e| {
-                    matches!(e, ChatEntry::ToolRunning { id, .. } if *id == rec.id)
-                }) {
+                if let Some(pos) = self
+                    .entries
+                    .iter()
+                    .rposition(|e| matches!(e, ChatEntry::ToolRunning { id, .. } if *id == rec.id))
+                {
                     self.entries[pos] = ChatEntry::ToolDone(rec);
                 } else {
                     self.push_entry(ChatEntry::ToolDone(rec));
@@ -688,29 +688,27 @@ impl TuiApp {
                 self.adjust_setting(item, true);
                 self.save_cfg();
             }
-            KeyCode::Enter => {
-                match item {
-                    SettingItem::Model => {
-                        self.editing_setting = Some(self.cfg.active_model().to_string());
-                    }
-                    SettingItem::GeminiKey => {
-                        self.editing_setting = Some(self.cfg.gemini_api_key.clone());
-                    }
-                    SettingItem::OpenaiKey => {
-                        self.editing_setting = Some(self.cfg.openai_api_key.clone());
-                    }
-                    SettingItem::AnthropicKey => {
-                        self.editing_setting = Some(self.cfg.anthropic_api_key.clone());
-                    }
-                    SettingItem::BaseUrl => {
-                        self.editing_setting = Some(self.cfg.active_base_url().to_string());
-                    }
-                    other => {
-                        self.adjust_setting(other, true);
-                        self.save_cfg();
-                    }
+            KeyCode::Enter => match item {
+                SettingItem::Model => {
+                    self.editing_setting = Some(self.cfg.active_model().to_string());
                 }
-            }
+                SettingItem::GeminiKey => {
+                    self.editing_setting = Some(self.cfg.gemini_api_key.clone());
+                }
+                SettingItem::OpenaiKey => {
+                    self.editing_setting = Some(self.cfg.openai_api_key.clone());
+                }
+                SettingItem::AnthropicKey => {
+                    self.editing_setting = Some(self.cfg.anthropic_api_key.clone());
+                }
+                SettingItem::BaseUrl => {
+                    self.editing_setting = Some(self.cfg.active_base_url().to_string());
+                }
+                other => {
+                    self.adjust_setting(other, true);
+                    self.save_cfg();
+                }
+            },
             _ => {}
         }
     }
@@ -848,7 +846,11 @@ impl TuiApp {
             ),
             Span::raw(" "),
             Span::styled(
-                format!(" {} • {} ", self.cfg.provider.short(), self.cfg.active_model()),
+                format!(
+                    " {} • {} ",
+                    self.cfg.provider.short(),
+                    self.cfg.active_model()
+                ),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -912,9 +914,19 @@ impl TuiApp {
                     ]));
                     lines.push(Line::from(vec![
                         Span::styled("   • Press ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("F2", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            "F2",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                         Span::styled(" or type ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("/settings", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            "/settings",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                         Span::styled(
                             " to configure Provider, Model, API Keys, and Guessing Mode.",
                             Style::default().fg(Color::DarkGray),
@@ -992,10 +1004,7 @@ impl TuiApp {
                         .unwrap_or_default();
                     lines.push(Line::from(vec![
                         Span::raw(format!("  {indent}")),
-                        Span::styled(
-                            format!("{spinner} "),
-                            Style::default().fg(Color::Yellow),
-                        ),
+                        Span::styled(format!("{spinner} "), Style::default().fg(Color::Yellow)),
                         Span::styled(via, Style::default().fg(Color::Magenta)),
                         Span::styled(
                             format!("[{id}] {tool} "),
@@ -1010,7 +1019,10 @@ impl TuiApp {
                     let indent = "    ".repeat(r.depth);
                     let tree = if r.depth > 0 { "↳ ⚡ " } else { "• " };
                     let (status_badge, status_color) = if r.output.success() {
-                        (format!("✓ exit 0 ({}ms)", r.output.duration_ms), Color::Green)
+                        (
+                            format!("✓ exit 0 ({}ms)", r.output.duration_ms),
+                            Color::Green,
+                        )
                     } else {
                         (
                             format!("✗ exit {} ({}ms)", r.output.exit_code, r.output.duration_ms),
@@ -1209,7 +1221,12 @@ impl TuiApp {
 
     fn draw_footer(&self, f: &mut ratatui::Frame, area: Rect) {
         let line = Line::from(vec![
-            Span::styled(" F2", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " F2",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(":Settings  ", Style::default().fg(Color::DarkGray)),
             Span::styled("/provider", Style::default().fg(Color::Yellow)),
             Span::styled(":Switch API  ", Style::default().fg(Color::DarkGray)),
@@ -1291,7 +1308,11 @@ impl TuiApp {
                 "Optimistic Finish",
                 format!(
                     "◀ {} ▶",
-                    if self.cfg.optimistic_finish { "ON" } else { "OFF" }
+                    if self.cfg.optimistic_finish {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
                 ),
                 "Finish inside a prediction branch without an extra turn",
             ),
@@ -1367,9 +1388,7 @@ impl TuiApp {
         let hint = if self.editing_setting.is_some() {
             "Typing new value... Press Enter to save or Esc to cancel."
         } else {
-            rows.get(self.setting_idx)
-                .map(|(_, _, h)| *h)
-                .unwrap_or("")
+            rows.get(self.setting_idx).map(|(_, _, h)| *h).unwrap_or("")
         };
         let hint_block = Block::default()
             .borders(Borders::ALL)

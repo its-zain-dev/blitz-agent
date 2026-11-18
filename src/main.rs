@@ -209,8 +209,8 @@ async fn run(a: RunArgs) -> Result<i32> {
             .mock_file
             .as_ref()
             .context("--mock-file is required with --provider mock")?;
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let items: Vec<serde_json::Value> =
             serde_json::from_str(&text).context("mock file must be a JSON array")?;
         LlmClient::mock(

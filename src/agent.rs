@@ -157,11 +157,7 @@ impl Agent {
         self.run_with_history(task, &mut msgs).await
     }
 
-    pub async fn run_with_history(
-        &self,
-        task: &str,
-        msgs: &mut Vec<Message>,
-    ) -> Result<RunResult> {
+    pub async fn run_with_history(&self, task: &str, msgs: &mut Vec<Message>) -> Result<RunResult> {
         let system = system_prompt_with(
             self.cfg.guess_mode,
             self.cfg.limits,
