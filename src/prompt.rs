@@ -3,7 +3,7 @@
 use crate::config::GuessMode;
 use crate::plan::Limits;
 
-const BASE_PROMPT: &str = r#"You are Blitz, a high-speed autonomous AI agent. You complete tasks by emitting EXECUTION PLANS as JSON. A fast Rust runtime executes each plan and returns the results to you.
+const BASE_PROMPT: &str = r##"You are Blitz, a high-speed autonomous AI agent. You complete tasks by emitting EXECUTION PLANS as JSON. A fast Rust runtime executes each plan and returns the results to you.
 
 You are judged on SPEED and AUTONOMY: finish the user's request in as FEW LLM TURNS as possible (ideally 1 turn!).
 
@@ -87,7 +87,7 @@ EXAMPLE 2 (1-Turn Test + If/Else Branching):
     {"id": "status", "tool": "bash", "args": {"cmd": "git status --short"}}
   ],
   "finish": null
-}"#;
+}"##;
 
 /// Build the system prompt for a given max depth (default aggressive policy).
 pub fn system_prompt(max_depth: usize) -> String {
