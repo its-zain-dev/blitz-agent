@@ -1,4 +1,4 @@
-//! Clean, full-terminal, borderless TUI for Blitz (`ratatui` + `crossterm`).
+//! Clean, organized widget-style TUI for Blitz (`ratatui` + `crossterm`).
 
 use std::io;
 use std::path::PathBuf;
@@ -21,34 +21,39 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, AgentConfig, AgentEvent, RunResult, Stats};
 use crate::config::{AppConfig, GuessMode};
-use crate::exec::{ExecEvent, Executor, NodeRecord, Outcome};
+use crate::exec::{ExecEvent, Executor, NodeRecord};
 use crate::llm::{LlmClient, Message, ProviderKind};
 use crate::tools::ToolBox;
 use crate::util::truncate_chars;
 
-const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const BRAILLE_SPINNER: &[&str] = &["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 
 #[derive(Debug, Clone)]
 enum ChatEntry {
-    Welcome,
+    Hero,
+    SlashCmd {
+        cmd: String,
+        result: String,
+    },
     User(String),
-    Thought(String),
+    Thought {
+        text: String,
+        llm_ms: u64,
+        has_tools: bool,
+    },
     ToolRunning {
         id: String,
         depth: usize,
-        tool: String,
-        summary: String,
+        verb: String,
+        detail: String,
     },
-    ToolDone(NodeRecord),
-    TurnSummary {
-        tools: usize,
-        chained: usize,
-        wall_ms: u64,
-        seq_ms: u64,
-        fast_finish: bool,
+    ToolDone {
+        record: NodeRecord,
+        verb: String,
+        detail: String,
+        is_last_in_turn: bool,
     },
     Assistant(String),
-    Notice(String),
     Error(String),
 }
 
@@ -98,8 +103,9 @@ enum WorkerMsg {
     },
 }
 
-/// Extract a clean human-readable 1-line summary of tool args (no noisy JSON braces).
-fn clean_tool_summary(tool: &str, args: &Value) -> String {
+/// Format a tool call into a clean `(verb, detail)` pair like `("Ran", "which agy && agy --version")`
+/// or `("Explored 1 search", "TODO")` or `("Edited 1 file", "src/main.rs")`.
+fn describe_tool(tool: &str, args: &Value) -> (String, String) {
     let raw = match tool {
         "bash" => args
             .get("cmd")
@@ -109,18 +115,31 @@ fn clean_tool_summary(tool: &str, args: &Value) -> String {
         "read_file" | "write_file" | "edit_file" | "list_dir" => {
             args.get("path").and_then(|v| v.as_str()).unwrap_or(".")
         }
-        "search" => args.get("pattern").and_then(|v| v.as_str()).unwrap_or(""),
+        "search" => args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
         _ => "",
     };
-    let single_line = raw.lines().next().unwrap_or("").trim();
-    if single_line.is_empty() {
-        truncate_chars(&args.to_string(), 60)
+    let single = raw.lines().next().unwrap_or("").trim();
+    let detail = if single.is_empty() {
+        truncate_chars(&args.to_string(), 56)
     } else {
-        truncate_chars(single_line, 60)
-    }
+        truncate_chars(single, 56)
+    };
+    let verb = match tool {
+        "bash" => "Ran".to_string(),
+        "read_file" => "Read 1 file".to_string(),
+        "write_file" => "Wrote 1 file".to_string(),
+        "edit_file" => "Edited 1 file".to_string(),
+        "list_dir" => "Explored 1 directory".to_string(),
+        "search" => "Explored 1 search".to_string(),
+        other => other.to_string(),
+    };
+    (verb, detail)
 }
 
-/// Word/character wrap a line to `max_cols` characters so 1 `Line` == 1 terminal row.
+/// Word/character wrap a string to `max_cols` characters so 1 `Line` == 1 visual terminal row.
 fn wrap_str(s: &str, max_cols: usize) -> Vec<String> {
     let width = max_cols.max(8);
     if s.is_empty() {
@@ -161,6 +180,49 @@ fn wrap_str(s: &str, max_cols: usize) -> Vec<String> {
     out
 }
 
+/// Parse inline `**bold**` markers into styled `Span`s.
+fn parse_inline_markdown(prefix: &str, text: &str, base_style: Style) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if !prefix.is_empty() {
+        spans.push(Span::styled(prefix.to_string(), base_style));
+    }
+    let mut rest = text;
+    let bold_style = base_style
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    while let Some(start) = rest.find("**") {
+        if start > 0 {
+            spans.push(Span::styled(rest[..start].to_string(), base_style));
+        }
+        let after_start = &rest[start + 2..];
+        if let Some(end) = after_start.find("**") {
+            spans.push(Span::styled(after_start[..end].to_string(), bold_style));
+            rest = &after_start[end + 2..];
+        } else {
+            spans.push(Span::styled(rest[start..].to_string(), base_style));
+            rest = "";
+            break;
+        }
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), base_style));
+    }
+    Line::from(spans)
+}
+
+fn short_home_path(p: &std::path::Path) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        let hp = std::path::Path::new(&home);
+        if p == hp {
+            return "~".into();
+        }
+        if let Ok(rel) = p.strip_prefix(hp) {
+            return format!("~/{}", rel.display());
+        }
+    }
+    p.display().to_string()
+}
+
 pub struct TuiApp {
     cfg: AppConfig,
     workdir: PathBuf,
@@ -180,7 +242,6 @@ pub struct TuiApp {
     running: Option<JoinHandle<()>>,
     running_label: String,
     last_thought: Option<String>,
-    pending_fast_finish: bool,
     worker_rx: Option<mpsc::UnboundedReceiver<WorkerMsg>>,
     tick: usize,
     should_quit: bool,
@@ -188,12 +249,15 @@ pub struct TuiApp {
 
 impl TuiApp {
     pub fn new(cfg: AppConfig, workdir: PathBuf) -> Self {
-        let mut entries = vec![ChatEntry::Welcome];
+        let mut entries = vec![ChatEntry::Hero];
         if cfg.active_api_key().trim().is_empty() {
-            entries.push(ChatEntry::Notice(format!(
-                "No API key set for {}. Type /key YOUR_KEY or /settings (F2).",
-                cfg.provider.label()
-            )));
+            entries.push(ChatEntry::SlashCmd {
+                cmd: "/status".into(),
+                result: format!(
+                    "No API key set for {}. Type /key YOUR_KEY or press F2 (/settings).",
+                    cfg.provider.label()
+                ),
+            });
         }
         Self {
             cfg,
@@ -214,7 +278,6 @@ impl TuiApp {
             running: None,
             running_label: String::new(),
             last_thought: None,
-            pending_fast_finish: false,
             worker_rx: None,
             tick: 0,
             should_quit: false,
@@ -234,8 +297,8 @@ impl TuiApp {
 
     fn start_task(&mut self, task: String) {
         if self.running.is_some() {
-            self.push_entry(ChatEntry::Notice(
-                "Busy — press Esc or type /cancel to stop the current task.".into(),
+            self.push_entry(ChatEntry::Error(
+                "A task is already running. Press Esc or type /cancel to stop it.".into(),
             ));
             return;
         }
@@ -249,7 +312,6 @@ impl TuiApp {
         };
 
         self.last_thought = None;
-        self.pending_fast_finish = false;
         self.push_entry(ChatEntry::User(task.clone()));
         let (tx, rx) = mpsc::unbounded_channel();
         let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
@@ -277,7 +339,7 @@ impl TuiApp {
             events: Some(agent_tx),
         };
         let mut history = self.history.clone();
-        self.running_label = "thinking...".into();
+        self.running_label = format!("Thinking with {}...", self.cfg.active_model());
         self.worker_rx = Some(rx);
         self.running = Some(tokio::spawn(async move {
             let t0 = Instant::now();
@@ -299,7 +361,10 @@ impl TuiApp {
             h.abort();
             self.worker_rx = None;
             self.running_label.clear();
-            self.push_entry(ChatEntry::Notice("Stopped.".into()));
+            self.push_entry(ChatEntry::SlashCmd {
+                cmd: "cancel".into(),
+                result: "Cancelled current task.".into(),
+            });
         }
     }
 
@@ -331,8 +396,8 @@ impl TuiApp {
                                 .or_else(|| self.last_thought.take());
                             match ans {
                                 Some(text) => self.push_entry(ChatEntry::Assistant(text)),
-                                None => self.push_entry(ChatEntry::Notice(format!(
-                                    "Reached max turns ({}) in {:.1}s.",
+                                None => self.push_entry(ChatEntry::Error(format!(
+                                    "Stopped after reaching max turns ({}) in {:.1}s.",
                                     self.cfg.max_turns,
                                     elapsed_ms as f64 / 1000.0
                                 ))),
@@ -347,19 +412,33 @@ impl TuiApp {
 
     fn on_agent_event(&mut self, ev: AgentEvent) {
         match ev {
-            AgentEvent::TurnStarted { turn, .. } => {
+            AgentEvent::TurnStarted { turn, model, .. } => {
                 self.running_label = if turn == 1 {
-                    "thinking...".into()
+                    format!("Thinking ({model})...")
                 } else {
-                    format!("turn {turn} · thinking...")
+                    format!("Turn {turn} · thinking ({model})...")
                 };
             }
-            AgentEvent::Thought(t) => {
-                self.last_thought = Some(t.clone());
-                self.push_entry(ChatEntry::Thought(t));
+            AgentEvent::Thought { text, llm_ms } => {
+                let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                self.running_label = truncate_chars(&one_line, 70);
+                self.last_thought = Some(text.clone());
+                self.push_entry(ChatEntry::Thought {
+                    text,
+                    llm_ms,
+                    has_tools: false,
+                });
             }
-            AgentEvent::PlanReady { steps, total_nodes } => {
-                self.running_label = format!("running {steps} parallel ({total_nodes} total)...");
+            AgentEvent::PlanReady { .. } => {
+                // Mark the preceding Thought as having tools so it renders with `○` + summary
+                if let Some(ChatEntry::Thought { has_tools, .. }) = self
+                    .entries
+                    .iter_mut()
+                    .rev()
+                    .find(|e| matches!(e, ChatEntry::Thought { .. }))
+                {
+                    *has_tools = true;
+                }
             }
             AgentEvent::Exec(ExecEvent::NodeStarted {
                 id,
@@ -368,43 +447,54 @@ impl TuiApp {
                 args,
                 ..
             }) => {
-                let summary = clean_tool_summary(&tool, &args);
-                self.running_label = format!("{tool} {summary}");
+                let (verb, detail) = describe_tool(&tool, &args);
+                self.running_label = format!("{verb} ({detail})");
                 self.push_entry(ChatEntry::ToolRunning {
                     id,
                     depth,
-                    tool,
-                    summary,
+                    verb,
+                    detail,
                 });
             }
             AgentEvent::Exec(ExecEvent::NodeFinished(rec)) => {
-                if let Some(pos) = self
-                    .entries
-                    .iter()
-                    .rposition(|e| matches!(e, ChatEntry::ToolRunning { id, .. } if *id == rec.id))
-                {
-                    self.entries[pos] = ChatEntry::ToolDone(rec);
+                let (verb, detail) = describe_tool(&rec.tool, &rec.args);
+                let done = ChatEntry::ToolDone {
+                    record: rec.clone(),
+                    verb,
+                    detail,
+                    is_last_in_turn: false,
+                };
+                if let Some(pos) = self.entries.iter().rposition(|e| {
+                    matches!(e, ChatEntry::ToolRunning { id, .. } if *id == rec.id)
+                }) {
+                    self.entries[pos] = done;
                 } else {
-                    self.push_entry(ChatEntry::ToolDone(rec));
+                    self.push_entry(done);
                 }
                 self.follow_bottom = true;
             }
-            AgentEvent::OptimisticFinish => {
-                self.pending_fast_finish = true;
-                if let Some(ChatEntry::TurnSummary { fast_finish, .. }) = self.entries.last_mut() {
-                    *fast_finish = true;
+            AgentEvent::TurnReport { .. } => {
+                // Clear previous `is_last_in_turn` flags and mark the latest ToolDone
+                for e in &mut self.entries {
+                    if let ChatEntry::ToolDone {
+                        is_last_in_turn, ..
+                    } = e
+                    {
+                        *is_last_in_turn = false;
+                    }
+                }
+                if let Some(ChatEntry::ToolDone {
+                    is_last_in_turn, ..
+                }) = self
+                    .entries
+                    .iter_mut()
+                    .rev()
+                    .find(|e| matches!(e, ChatEntry::ToolDone { .. }))
+                {
+                    *is_last_in_turn = true;
                 }
             }
-            AgentEvent::TurnReport { report, .. } => {
-                let fast = std::mem::take(&mut self.pending_fast_finish);
-                self.push_entry(ChatEntry::TurnSummary {
-                    tools: report.tool_calls(),
-                    chained: report.chained(),
-                    wall_ms: report.wall_ms,
-                    seq_ms: report.tool_ms(),
-                    fast_finish: fast,
-                });
-            }
+            AgentEvent::OptimisticFinish => {}
             AgentEvent::ParseError(e) => {
                 self.push_entry(ChatEntry::Error(format!("Retrying plan: {e}")));
             }
@@ -446,19 +536,23 @@ impl TuiApp {
                         "openai" | "o" => self.cfg.provider = ProviderKind::Openai,
                         "anthropic" | "claude" | "a" => self.cfg.provider = ProviderKind::Anthropic,
                         _ => {
-                            self.push_entry(ChatEntry::Error(
-                                "Usage: /provider <gemini|openai|anthropic>".into(),
-                            ));
+                            self.push_entry(ChatEntry::SlashCmd {
+                                cmd: line.to_string(),
+                                result: "Usage: /provider <gemini|openai|anthropic>".into(),
+                            });
                             return;
                         }
                     }
                 }
                 self.save_cfg();
-                self.push_entry(ChatEntry::Notice(format!(
-                    "Provider: {} ({})",
-                    self.cfg.provider.label(),
-                    self.cfg.active_model()
-                )));
+                self.push_entry(ChatEntry::SlashCmd {
+                    cmd: line.to_string(),
+                    result: format!(
+                        "Provider set to {} ({})",
+                        self.cfg.provider.label(),
+                        self.cfg.active_model()
+                    ),
+                });
             }
             "/model" | "/m" => {
                 if arg.is_empty() {
@@ -467,10 +561,14 @@ impl TuiApp {
                     self.cfg.set_active_model(arg.to_string());
                 }
                 self.save_cfg();
-                self.push_entry(ChatEntry::Notice(format!(
-                    "Model: {}",
-                    self.cfg.active_model()
-                )));
+                self.push_entry(ChatEntry::SlashCmd {
+                    cmd: line.to_string(),
+                    result: format!(
+                        "Model set to {} ({})",
+                        self.cfg.active_model(),
+                        self.cfg.guess_mode.label()
+                    ),
+                });
             }
             "/key" | "/k" => {
                 if arg.is_empty() {
@@ -483,11 +581,14 @@ impl TuiApp {
                 } else {
                     self.cfg.set_active_api_key(arg.to_string());
                     self.save_cfg();
-                    self.push_entry(ChatEntry::Notice(format!(
-                        "Saved {} key ({})",
-                        self.cfg.provider.label(),
-                        AppConfig::mask_key(self.cfg.active_api_key())
-                    )));
+                    self.push_entry(ChatEntry::SlashCmd {
+                        cmd: "/key ********".into(),
+                        result: format!(
+                            "API key saved for {} ({})",
+                            self.cfg.provider.label(),
+                            AppConfig::mask_key(self.cfg.active_api_key())
+                        ),
+                    });
                 }
             }
             "/guess" | "/g" => {
@@ -502,66 +603,74 @@ impl TuiApp {
                         }
                         "off" | "none" | "o" => self.cfg.guess_mode = GuessMode::Off,
                         _ => {
-                            self.push_entry(ChatEntry::Error(
-                                "Usage: /guess <aggressive|balanced|conservative|off>".into(),
-                            ));
+                            self.push_entry(ChatEntry::SlashCmd {
+                                cmd: line.to_string(),
+                                result: "Usage: /guess <aggressive|balanced|conservative|off>"
+                                    .into(),
+                            });
                             return;
                         }
                     }
                 }
                 self.save_cfg();
-                self.push_entry(ChatEntry::Notice(format!(
-                    "Guess mode: {}",
-                    self.cfg.guess_mode.label()
-                )));
+                self.push_entry(ChatEntry::SlashCmd {
+                    cmd: line.to_string(),
+                    result: format!("Guessing mode set to {}", self.cfg.guess_mode.label()),
+                });
             }
             "/depth" => {
                 if let Ok(d) = arg.parse::<usize>() {
                     self.cfg.max_depth = d.clamp(1, 8);
                     self.save_cfg();
-                    self.push_entry(ChatEntry::Notice(format!(
-                        "Max guess depth: {}",
-                        self.cfg.max_depth
-                    )));
+                    self.push_entry(ChatEntry::SlashCmd {
+                        cmd: line.to_string(),
+                        result: format!("Max prediction depth set to {}", self.cfg.max_depth),
+                    });
                 } else {
-                    self.push_entry(ChatEntry::Error("Usage: /depth <1..8>".into()));
+                    self.push_entry(ChatEntry::SlashCmd {
+                        cmd: line.to_string(),
+                        result: "Usage: /depth <1..8>".into(),
+                    });
                 }
             }
             "/output" | "/o" => {
                 self.show_tool_output = !self.show_tool_output;
-                self.push_entry(ChatEntry::Notice(format!(
-                    "Tool stdout logs: {}",
-                    if self.show_tool_output {
-                        "shown"
-                    } else {
-                        "hidden"
-                    }
-                )));
+                self.push_entry(ChatEntry::SlashCmd {
+                    cmd: line.to_string(),
+                    result: format!(
+                        "Tool output expansion {}",
+                        if self.show_tool_output {
+                            "enabled"
+                        } else {
+                            "collapsed"
+                        }
+                    ),
+                });
             }
             "/cancel" | "/stop" => self.cancel_running(),
             "/clear" | "/reset" => {
                 self.entries.clear();
                 self.history.clear();
-                self.entries.push(ChatEntry::Welcome);
+                self.entries.push(ChatEntry::Hero);
                 self.scroll = 0;
                 self.follow_bottom = true;
             }
             "/help" | "/h" | "/?" => {
-                self.push_entry(ChatEntry::Notice(
-                    "/settings (F2)  Open settings       /provider [name]  Switch API\n\
-                     /model [name]   Switch model        /key <api_key>    Save API key\n\
-                     /guess [mode]   Guessing policy     /output (Ctrl+O)  Toggle tool logs\n\
-                     /clear          Reset conversation  /quit (Ctrl+C)    Exit"
-                        .into(),
-                ));
+                self.push_entry(ChatEntry::SlashCmd {
+                    cmd: "/help".into(),
+                    result:
+                        "/settings (F2) · /model [name] · /provider [name] · /key <key> · /guess [mode] · /output (ctrl+o) · /clear · /quit"
+                            .into(),
+                });
             }
             "/quit" | "/exit" | "/q" => {
                 self.should_quit = true;
             }
-            other => {
-                self.push_entry(ChatEntry::Error(format!(
-                    "Unknown command '{other}' — type /help or /settings"
-                )));
+            _ => {
+                self.push_entry(ChatEntry::SlashCmd {
+                    cmd: line.to_string(),
+                    result: "Unknown command. Type /help or /settings (F2).".into(),
+                });
             }
         }
     }
@@ -838,98 +947,101 @@ impl TuiApp {
     }
 
     fn draw(&mut self, f: &mut ratatui::Frame) {
+        let bottom_height = if self.running.is_some() { 5 } else { 4 };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(4),
-                Constraint::Length(2),
-            ])
+            .constraints([Constraint::Min(4), Constraint::Length(bottom_height)])
             .split(f.area());
 
-        self.draw_top_bar(f, chunks[0]);
-        self.draw_chat_canvas(f, chunks[1]);
-        self.draw_bottom_prompt(f, chunks[2]);
+        self.draw_feed(f, chunks[0]);
+        self.draw_bottom(f, chunks[1]);
 
         if self.show_settings {
             self.draw_settings_modal(f, f.area());
         }
     }
 
-    fn draw_top_bar(&self, f: &mut ratatui::Frame, area: Rect) {
-        let spinner = SPINNER[self.tick % SPINNER.len()];
-        let mut spans = vec![
-            Span::styled(
-                "⚡ blitz ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                self.cfg.active_model().to_string(),
-                Style::default().fg(Color::White),
-            ),
-            Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("guess:{}", self.cfg.guess_mode.short().to_lowercase()),
-                Style::default().fg(Color::Magenta),
-            ),
-        ];
-
-        if self.running.is_some() {
-            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
-            spans.push(Span::styled(
-                format!("{spinner} {}", self.running_label),
-                Style::default().fg(Color::Yellow),
-            ));
-        } else if self.stats.tool_calls > 0 {
-            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
-            spans.push(Span::styled(
-                format!(
-                    "{} tools ({} guessed) {:.1}x",
-                    self.stats.tool_calls,
-                    self.stats.chained,
-                    self.stats.parallel_speedup()
-                ),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
-    }
-
-    fn draw_chat_canvas(&mut self, f: &mut ratatui::Frame, area: Rect) {
+    fn draw_feed(&mut self, f: &mut ratatui::Frame, area: Rect) {
         let width = area.width as usize;
         let mut lines: Vec<Line> = Vec::new();
-        let spinner = SPINNER[self.tick % SPINNER.len()];
+        let braille = BRAILLE_SPINNER[self.tick % BRAILLE_SPINNER.len()];
 
         for entry in &self.entries {
             match entry {
-                ChatEntry::Welcome => {
+                ChatEntry::Hero => {
+                    let key_status = if self.cfg.active_api_key().trim().is_empty() {
+                        "No API Key · /settings"
+                    } else {
+                        "API Ready"
+                    };
+                    let dir_str = short_home_path(&self.workdir);
+                    lines.push(Line::from(""));
                     lines.push(Line::from(vec![
+                        Span::styled("      ▄▀▀▄        ", Style::default().fg(Color::Cyan)),
                         Span::styled(
-                            "⚡ blitz",
+                            "Blitz CLI 0.3.0",
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(Color::White)
                                 .add_modifier(Modifier::BOLD),
                         ),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::styled("     ▀▀▀▀▀▀       ", Style::default().fg(Color::Cyan)),
                         Span::styled(
-                            " — parallel & speculative agent  (/settings · /model · /guess · /help)",
-                            Style::default().fg(Color::DarkGray),
+                            format!("{} ({key_status})", self.cfg.provider.label()),
+                            Style::default().fg(Color::Gray),
                         ),
                     ]));
+                    lines.push(Line::from(vec![
+                        Span::styled("    ▀▀▀▀▀▀▀▀      ", Style::default().fg(Color::Cyan)),
+                        Span::styled(
+                            format!(
+                                "{} ({})",
+                                self.cfg.active_model(),
+                                self.cfg.guess_mode.short().to_lowercase()
+                            ),
+                            Style::default().fg(Color::Gray),
+                        ),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::styled("   ▄▀▀    ▀▀▄     ", Style::default().fg(Color::Cyan)),
+                        Span::styled(dir_str, Style::default().fg(Color::DarkGray)),
+                    ]));
+                    lines.push(Line::from(vec![Span::styled(
+                        "  ▄▀▀      ▀▀▄",
+                        Style::default().fg(Color::Cyan),
+                    )]));
+                    lines.push(Line::from(""));
+                }
+                ChatEntry::SlashCmd { cmd, result } => {
+                    lines.push(Line::from(vec![
+                        Span::styled("> ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(cmd.clone(), Style::default().fg(Color::White)),
+                    ]));
+                    for part in wrap_str(result, width.saturating_sub(6)) {
+                        lines.push(Line::from(vec![
+                            Span::styled("  ⎿  ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(part, Style::default().fg(Color::Gray)),
+                        ]));
+                    }
+                    lines.push(Line::from(""));
                 }
                 ChatEntry::User(text) => {
-                    lines.push(Line::from(""));
+                    let rule = "─".repeat(width.min(60));
+                    lines.push(Line::from(Span::styled(
+                        rule,
+                        Style::default().fg(Color::DarkGray),
+                    )));
                     for (idx, raw) in text.lines().enumerate() {
-                        let wrapped = wrap_str(raw, width.saturating_sub(2));
-                        for (widx, part) in wrapped.into_iter().enumerate() {
-                            let prefix = if idx == 0 && widx == 0 { "❯ " } else { "  " };
+                        for (widx, part) in
+                            wrap_str(raw, width.saturating_sub(2)).into_iter().enumerate()
+                        {
+                            let prefix = if idx == 0 && widx == 0 { "> " } else { "  " };
                             lines.push(Line::from(vec![
                                 Span::styled(
                                     prefix,
                                     Style::default()
-                                        .fg(Color::Cyan)
+                                        .fg(Color::White)
                                         .add_modifier(Modifier::BOLD),
                                 ),
                                 Span::styled(
@@ -941,82 +1053,107 @@ impl TuiApp {
                             ]));
                         }
                     }
+                    lines.push(Line::from(""));
                 }
-                ChatEntry::Thought(t) => {
-                    let one_line = t.split_whitespace().collect::<Vec<_>>().join(" ");
-                    let clipped = truncate_chars(&one_line, width.saturating_sub(5));
-                    lines.push(Line::from(vec![
-                        Span::styled("  💭 ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(
-                            clipped,
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        ),
-                    ]));
+                ChatEntry::Thought {
+                    text,
+                    llm_ms,
+                    has_tools,
+                } => {
+                    let secs = *llm_ms as f64 / 1000.0;
+                    if *has_tools {
+                        let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let prefix = format!("○ Thought for {secs:.1}s (");
+                        let max_preview = width.saturating_sub(prefix.len() + 2);
+                        let preview = truncate_chars(&one_line, max_preview);
+                        lines.push(Line::from(vec![
+                            Span::styled("○ ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                format!("Thought for {secs:.1}s "),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(
+                                format!("({preview})"),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::styled("▸ ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                format!("Thought for {secs:.1}s"),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]));
+                    }
                 }
                 ChatEntry::ToolRunning {
                     depth,
-                    tool,
-                    summary,
+                    verb,
+                    detail,
                     ..
                 } => {
-                    let indent = "  ".repeat(depth + 1);
-                    let max_s = width.saturating_sub(indent.len() + tool.len() + 6);
+                    let prefix = if *depth > 0 { "  ⎿  " } else { "" };
                     lines.push(Line::from(vec![
-                        Span::raw(indent),
-                        Span::styled(format!("{spinner} "), Style::default().fg(Color::Yellow)),
-                        Span::styled(format!("{tool} "), Style::default().fg(Color::Cyan)),
+                        Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("{braille} "), Style::default().fg(Color::Cyan)),
                         Span::styled(
-                            truncate_chars(summary, max_s),
+                            format!("{verb} "),
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("({detail})"),
                             Style::default().fg(Color::DarkGray),
                         ),
                     ]));
                 }
-                ChatEntry::ToolDone(r) => {
-                    let indent = "  ".repeat(r.depth + 1);
-                    let (icon, icon_color) = if r.output.success() {
-                        ("✓", Color::Green)
+                ChatEntry::ToolDone {
+                    record,
+                    verb,
+                    detail,
+                    is_last_in_turn,
+                } => {
+                    let ok = record.output.success();
+                    let dot_color = if ok { Color::Green } else { Color::Red };
+                    let mut spans = Vec::new();
+                    if record.depth > 0 {
+                        spans.push(Span::styled("  ⎿  ", Style::default().fg(Color::DarkGray)));
+                        spans.push(Span::styled("● ", Style::default().fg(dot_color)));
                     } else {
-                        ("✗", Color::Red)
-                    };
-                    let chain_tag = if r.depth > 0 { "↳ " } else { "" };
-                    let summary = clean_tool_summary(&r.tool, &r.args);
-                    let guess_tag = match &r.outcome {
-                        Outcome::Hit { spawned, .. } if !spawned.is_empty() => {
-                            format!("  ⚡→ {}", spawned.join(","))
-                        }
-                        Outcome::Miss { .. } => "  (miss)".into(),
-                        _ => String::new(),
-                    };
-                    let max_s = width.saturating_sub(
-                        indent.len() + chain_tag.len() + r.tool.len() + guess_tag.len() + 14,
-                    );
-                    lines.push(Line::from(vec![
-                        Span::raw(indent.clone()),
-                        Span::styled(chain_tag, Style::default().fg(Color::Magenta)),
-                        Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
-                        Span::styled(format!("{} ", r.tool), Style::default().fg(Color::Cyan)),
-                        Span::styled(
-                            format!("{} ", truncate_chars(&summary, max_s)),
-                            Style::default().fg(Color::Gray),
-                        ),
-                        Span::styled(
-                            format!("{}ms", r.output.duration_ms),
+                        spans.push(Span::styled("● ", Style::default().fg(dot_color)));
+                    }
+                    spans.push(Span::styled(
+                        format!("{verb} "),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::styled(
+                        format!("({detail})"),
+                        Style::default().fg(Color::Gray),
+                    ));
+                    if !ok {
+                        spans.push(Span::styled(" failed", Style::default().fg(Color::Red)));
+                    }
+                    if *is_last_in_turn {
+                        spans.push(Span::styled(
+                            " (ctrl+o to expand)",
                             Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled(guess_tag, Style::default().fg(Color::LightGreen)),
-                    ]));
+                        ));
+                    }
+                    lines.push(Line::from(spans));
 
                     if self.show_tool_output {
-                        let out = r.output.display();
+                        let out = record.output.display();
                         let trimmed = out.trim();
                         if !trimmed.is_empty() {
-                            for l in trimmed.lines().take(3) {
+                            for l in trimmed.lines().take(6) {
                                 lines.push(Line::from(vec![
-                                    Span::raw(format!("{indent}  │ ")),
+                                    Span::styled("  ⎿  ", Style::default().fg(Color::DarkGray)),
                                     Span::styled(
-                                        truncate_chars(l, width.saturating_sub(indent.len() + 6)),
+                                        truncate_chars(l, width.saturating_sub(6)),
                                         Style::default().fg(Color::DarkGray),
                                     ),
                                 ]));
@@ -1024,60 +1161,22 @@ impl TuiApp {
                         }
                     }
                 }
-                ChatEntry::TurnSummary {
-                    tools,
-                    chained,
-                    wall_ms,
-                    seq_ms,
-                    fast_finish,
-                } => {
-                    let speedup = if *wall_ms > 0 {
-                        (*seq_ms as f64 / *wall_ms as f64).max(1.0)
-                    } else {
-                        1.0
-                    };
-                    let ff = if *fast_finish {
-                        " · instant finish"
-                    } else {
-                        ""
-                    };
-                    lines.push(Line::from(vec![Span::styled(
-                        format!(
-                            "  ⚡ {tools} tools ({chained} auto-chained) · {wall_ms}ms ({speedup:.1}x){ff}"
-                        ),
-                        Style::default().fg(Color::DarkGray),
-                    )]));
-                }
                 ChatEntry::Assistant(ans) => {
                     lines.push(Line::from(""));
-                    for raw in ans.lines() {
-                        for part in wrap_str(raw, width.saturating_sub(1)) {
-                            lines.push(Line::from(Span::styled(
-                                part,
-                                Style::default().fg(Color::White),
-                            )));
-                        }
-                    }
-                }
-                ChatEntry::Notice(msg) => {
-                    for raw in msg.lines() {
-                        for part in wrap_str(raw, width.saturating_sub(3)) {
-                            lines.push(Line::from(vec![
-                                Span::styled("· ", Style::default().fg(Color::Cyan)),
-                                Span::styled(part, Style::default().fg(Color::Cyan)),
-                            ]));
-                        }
-                    }
+                    self.render_markdown_response(ans, width, &mut lines);
+                    lines.push(Line::from(""));
                 }
                 ChatEntry::Error(err) => {
+                    lines.push(Line::from(""));
                     for raw in err.lines() {
-                        for part in wrap_str(raw, width.saturating_sub(3)) {
+                        for part in wrap_str(raw, width.saturating_sub(4)) {
                             lines.push(Line::from(vec![
-                                Span::styled("! ", Style::default().fg(Color::Red)),
+                                Span::styled("⚠ ", Style::default().fg(Color::Yellow)),
                                 Span::styled(part, Style::default().fg(Color::LightRed)),
                             ]));
                         }
                     }
+                    lines.push(Line::from(""));
                 }
             }
         }
@@ -1094,62 +1193,156 @@ impl TuiApp {
         f.render_widget(paragraph, area);
     }
 
-    fn draw_bottom_prompt(&self, f: &mut ratatui::Frame, area: Rect) {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)])
-            .split(area);
+    fn render_markdown_response(&self, text: &str, width: usize, lines: &mut Vec<Line<'static>>) {
+        let content_width = width.saturating_sub(4).max(12);
+        let mut in_code_block = false;
 
-        let rule_width = area.width as usize;
-        let hint = if self.running.is_some() {
-            " Esc to stop "
-        } else {
-            " /settings · /help "
-        };
-        let rule_len = rule_width.saturating_sub(hint.len());
-        let rule_line = Line::from(vec![
-            Span::styled("─".repeat(rule_len), Style::default().fg(Color::DarkGray)),
-            Span::styled(hint, Style::default().fg(Color::DarkGray)),
-        ]);
-        f.render_widget(Paragraph::new(rule_line), rows[0]);
-
-        let prompt_line = if self.input.is_empty() && self.running.is_none() {
-            Line::from(vec![
-                Span::styled(
-                    "❯ ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "Ask anything or type /settings...",
+        for raw in text.lines() {
+            let trimmed = raw.trim();
+            if trimmed.starts_with("```") {
+                in_code_block = !in_code_block;
+                continue;
+            }
+            if in_code_block {
+                for part in wrap_str(raw, content_width.saturating_sub(2)) {
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(part, Style::default().fg(Color::Cyan)),
+                    ]));
+                }
+                continue;
+            }
+            if trimmed == "---" || trimmed == "***" {
+                lines.push(Line::from(Span::styled(
+                    "  ──────",
                     Style::default().fg(Color::DarkGray),
-                ),
-            ])
+                )));
+                continue;
+            }
+            if trimmed.is_empty() {
+                lines.push(Line::from(""));
+                continue;
+            }
+            if trimmed.starts_with('#') {
+                let heading = trimmed.trim_start_matches('#').trim();
+                for part in wrap_str(heading, content_width) {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            part,
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                }
+                continue;
+            }
+            if let Some(rest) = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+                .or_else(|| trimmed.strip_prefix("• "))
+            {
+                let wrapped = wrap_str(rest, content_width.saturating_sub(2));
+                for (i, part) in wrapped.into_iter().enumerate() {
+                    let prefix = if i == 0 { "  • " } else { "    " };
+                    lines.push(parse_inline_markdown(
+                        prefix,
+                        &part,
+                        Style::default().fg(Color::Gray),
+                    ));
+                }
+                continue;
+            }
+
+            for part in wrap_str(raw, content_width) {
+                lines.push(parse_inline_markdown(
+                    "  ",
+                    &part,
+                    Style::default().fg(Color::White),
+                ));
+            }
+        }
+    }
+
+    fn draw_bottom(&self, f: &mut ratatui::Frame, area: Rect) {
+        let width = area.width as usize;
+        let full_rule = "─".repeat(width);
+        let braille = BRAILLE_SPINNER[self.tick % BRAILLE_SPINNER.len()];
+
+        let mut y_offset = 0u16;
+        if self.running.is_some() {
+            let spinner_rect = Rect::new(area.x, area.y, area.width, 1);
+            let label = truncate_chars(&self.running_label, width.saturating_sub(4));
+            let spinner_line = Line::from(vec![
+                Span::styled(format!("{braille}  "), Style::default().fg(Color::Cyan)),
+                Span::styled(label, Style::default().fg(Color::Gray)),
+            ]);
+            f.render_widget(Paragraph::new(spinner_line), spinner_rect);
+            y_offset = 1;
+        }
+
+        let top_rule_rect = Rect::new(area.x, area.y + y_offset, area.width, 1);
+        let input_rect = Rect::new(area.x, area.y + y_offset + 1, area.width, 1);
+        let bot_rule_rect = Rect::new(area.x, area.y + y_offset + 2, area.width, 1);
+        let footer_rect = Rect::new(area.x, area.y + y_offset + 3, area.width, 1);
+
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                full_rule.clone(),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            top_rule_rect,
+        );
+
+        let prompt_line = Line::from(vec![
+            Span::styled(
+                "> ",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(self.input.clone(), Style::default().fg(Color::White)),
+        ]);
+        f.render_widget(Paragraph::new(prompt_line), input_rect);
+
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                full_rule,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            bot_rule_rect,
+        );
+
+        let left = if self.running.is_some() {
+            "esc to cancel"
         } else {
-            Line::from(vec![
-                Span::styled(
-                    "❯ ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(self.input.clone(), Style::default().fg(Color::White)),
-            ])
+            "/settings (f2) · /model · /guess"
         };
-        f.render_widget(Paragraph::new(prompt_line), rows[1]);
+        let right = format!(
+            "{} · {}",
+            self.cfg.active_model(),
+            self.cfg.guess_mode.short().to_lowercase()
+        );
+        let pad = width.saturating_sub(left.chars().count() + right.chars().count());
+        let footer_line = Line::from(vec![
+            Span::styled(left, Style::default().fg(Color::DarkGray)),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(right, Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(footer_line), footer_rect);
 
         if !self.show_settings {
-            let x = (rows[1].x + 2 + self.input[..self.cursor].chars().count() as u16)
-                .min(rows[1].x + rows[1].width.saturating_sub(1));
-            let y = rows[1].y;
+            let x = (input_rect.x + 2 + self.input[..self.cursor].chars().count() as u16)
+                .min(input_rect.x + input_rect.width.saturating_sub(1));
+            let y = input_rect.y;
             f.set_cursor_position((x, y));
         }
     }
 
     fn draw_settings_modal(&self, f: &mut ratatui::Frame, area: Rect) {
-        let w = area.width.saturating_sub(2).min(76);
-        let h = area.height.saturating_sub(2).min(21);
+        let w = area.width.saturating_sub(2).min(74);
+        let h = area.height.saturating_sub(2).min(20);
         let x = area.x + (area.width.saturating_sub(w)) / 2;
         let y = area.y + (area.height.saturating_sub(h)) / 2;
         let modal = Rect::new(x, y, w, h);
@@ -1159,8 +1352,14 @@ impl TuiApp {
         let rows: Vec<(&str, String)> = vec![
             ("Provider", format!("◀ {} ▶", self.cfg.provider.label())),
             ("Model", format!("◀ {} ▶", self.cfg.active_model())),
-            ("Gemini Key", AppConfig::mask_key(&self.cfg.gemini_api_key)),
-            ("OpenAI Key", AppConfig::mask_key(&self.cfg.openai_api_key)),
+            (
+                "Gemini Key",
+                AppConfig::mask_key(&self.cfg.gemini_api_key),
+            ),
+            (
+                "OpenAI Key",
+                AppConfig::mask_key(&self.cfg.openai_api_key),
+            ),
             (
                 "Anthropic Key",
                 AppConfig::mask_key(&self.cfg.anthropic_api_key),
@@ -1174,11 +1373,7 @@ impl TuiApp {
                 "Fast Finish",
                 format!(
                     "◀ {} ▶",
-                    if self.cfg.optimistic_finish {
-                        "ON"
-                    } else {
-                        "OFF"
-                    }
+                    if self.cfg.optimistic_finish { "ON" } else { "OFF" }
                 ),
             ),
             ("Concurrency", format!("◀ {}x ▶", self.cfg.concurrency)),

@@ -22,7 +22,10 @@ pub enum AgentEvent {
         max_turns: usize,
         model: String,
     },
-    Thought(String),
+    Thought {
+        text: String,
+        llm_ms: u64,
+    },
     PlanReady {
         steps: usize,
         total_nodes: usize,
@@ -183,8 +186,9 @@ impl Agent {
             });
             let t0 = Instant::now();
             let reply = self.llm.complete(&system, msgs).await?;
+            let turn_llm_ms = t0.elapsed().as_millis() as u64;
             stats.llm_turns += 1;
-            stats.llm_ms += t0.elapsed().as_millis() as u64;
+            stats.llm_ms += turn_llm_ms;
             msgs.push(Message::assistant(reply.clone()));
 
             let parsed = Plan::parse(&reply).and_then(|mut p| {
@@ -213,7 +217,10 @@ impl Agent {
 
             if let Some(t) = &plan.thought {
                 self.log(format!("💭 {}", truncate_chars(t, 300)));
-                self.emit(AgentEvent::Thought(t.clone()));
+                self.emit(AgentEvent::Thought {
+                    text: t.clone(),
+                    llm_ms: turn_llm_ms,
+                });
             }
             if plan.steps.is_empty() {
                 if let Some(f) = plan.finish {

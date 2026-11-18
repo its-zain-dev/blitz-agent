@@ -1,6 +1,6 @@
 [package]
 name = "blitz-agent"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A speculative, parallel AI agent with a full TUI: many tools per turn + predicted branches that auto-chain without LLM round trips."
 license = "MIT"
