@@ -47,7 +47,8 @@ jobs:
   demo:
     name: build + demo
     runs-on: ubuntu-latest
-    needs: test
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -59,10 +60,32 @@ jobs:
         run: ./target/release/blitz run "explore this repo and write a report" --provider mock --mock-file examples/mock_session.json
       - name: Show system prompt
         run: ./target/release/blitz prompt | head -20
+      - name: Build Android/Termux ARM64 binary (aarch64-linux-android)
+        run: |
+          rustup target add aarch64-linux-android
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TOOLCHAIN/aarch64-linux-android24-clang"
+          export CC_aarch64_linux_android="$TOOLCHAIN/aarch64-linux-android24-clang"
+          export AR_aarch64_linux_android="$TOOLCHAIN/llvm-ar"
+          cargo build --release --target aarch64-linux-android
       - uses: actions/upload-artifact@v5
         with:
           name: blitz-linux-x86_64
           path: target/release/blitz
+      - uses: actions/upload-artifact@v5
+        with:
+          name: blitz-android-arm64
+          path: target/aarch64-linux-android/release/blitz
+      - name: Publish GitHub Release binaries
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp target/release/blitz blitz-linux-x86_64
+          cp target/aarch64-linux-android/release/blitz blitz-android-arm64
+          gh release view v0.1.0 >/dev/null 2>&1 || gh release create v0.1.0 --title "Blitz v0.1.0" --notes "Prebuilt binaries for Linux x86_64 and Android/Termux ARM64"
+          gh release upload v0.1.0 blitz-linux-x86_64 blitz-android-arm64 --clobber
 
   live:
     name: live LLM smoke test (${{ matrix.provider }})
