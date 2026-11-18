@@ -70,11 +70,16 @@ impl Plan {
         if self.steps.is_empty() && self.finish.is_none() {
             return Err("plan has no steps and no finish".into());
         }
+        // Pass 1: structure, limits, tools, regexes and explicit ids.
         let mut ids = HashSet::new();
-        let mut counter = 0usize;
         let mut total = 0usize;
+        for n in &self.steps {
+            check_node(n, 0, known_tools, limits, &mut ids, &mut total)?;
+        }
+        // Pass 2: give unnamed nodes ids that cannot collide with explicit ones.
+        let mut counter = 0usize;
         for n in self.steps.iter_mut() {
-            validate_node(n, 0, known_tools, limits, &mut ids, &mut counter, &mut total)?;
+            assign_ids(n, &mut ids, &mut counter);
         }
         Ok(())
     }
@@ -93,13 +98,12 @@ impl Plan {
     }
 }
 
-fn validate_node(
-    n: &mut Node,
+fn check_node(
+    n: &Node,
     depth: usize,
     tools: &[&str],
     limits: &Limits,
     ids: &mut HashSet<String>,
-    counter: &mut usize,
     total: &mut usize,
 ) -> Result<(), String> {
     *total += 1;
@@ -115,35 +119,46 @@ fn validate_node(
             limits.max_depth
         ));
     }
-    if n.id.trim().is_empty() {
-        loop {
-            *counter += 1;
-            let candidate = format!("_{}", counter);
-            if !ids.contains(&candidate) {
-                n.id = candidate;
-                break;
-            }
-        }
+    let id = n.id.trim();
+    if !id.is_empty() && !ids.insert(id.to_string()) {
+        return Err(format!("duplicate node id '{id}'"));
     }
-    if !ids.insert(n.id.clone()) {
-        return Err(format!("duplicate node id '{}'", n.id));
-    }
+    let label = if id.is_empty() { "<unnamed>" } else { id };
     if !tools.contains(&n.tool.as_str()) {
         return Err(format!(
             "node '{}': unknown tool '{}'. Available tools: {}",
-            n.id,
+            label,
             n.tool,
             tools.join(", ")
         ));
     }
-    let id = n.id.clone();
-    for (i, b) in n.predict.iter_mut().enumerate() {
+    for (i, b) in n.predict.iter().enumerate() {
         b.when
             .validate()
-            .map_err(|e| format!("node '{}' predict #{}: {}", id, i, e))?;
-        for c in b.then.iter_mut() {
-            validate_node(c, depth + 1, tools, limits, ids, counter, total)?;
+            .map_err(|e| format!("node '{label}' predict #{i}: {e}"))?;
+        for c in &b.then {
+            check_node(c, depth + 1, tools, limits, ids, total)?;
         }
     }
     Ok(())
+}
+
+fn assign_ids(n: &mut Node, ids: &mut HashSet<String>, counter: &mut usize) {
+    if n.id.trim().is_empty() {
+        loop {
+            *counter += 1;
+            let candidate = format!("_{counter}");
+            if ids.insert(candidate.clone()) {
+                n.id = candidate;
+                break;
+            }
+        }
+    } else {
+        n.id = n.id.trim().to_string();
+    }
+    for b in n.predict.iter_mut() {
+        for c in b.then.iter_mut() {
+            assign_ids(c, ids, counter);
+        }
+    }
 }
