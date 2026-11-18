@@ -1,0 +1,33 @@
+[package]
+name = "blitz-agent"
+version = "0.1.0"
+edition = "2021"
+description = "A speculative, parallel AI agent: many tools per turn + predicted branches that auto-chain without LLM round trips."
+license = "MIT"
+readme = "README.md"
+
+[lib]
+name = "blitz"
+path = "src/lib.rs"
+
+[[bin]]
+name = "blitz"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets -- --nocapture
+
+  demo:
+    name: build + demo
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Speculative plan (no LLM)
+        run: ./target/release/blitz exec examples/demo_plan.json
+      - name: Full agent loop with scripted mock model
+        run: ./target/release/blitz run "explore this repo and write a report" --provider mock --mock-file examples/mock_session.json
+      - name: Show system prompt
+        run: ./target/release/blitz prompt | head -20
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blitz-linux-x86_64
+          path: target/release/blitz
+
+  live:
+    name: live LLM smoke test (${{ matrix.provider }})
+    runs-on: ubuntu-latest
+    needs: test
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [gemini, openai, anthropic]
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      PROVIDER: ${{ matrix.provider }}
+    steps:
+      - name: Check for API key
+        id: key
+        run: |
+          case "$PROVIDER" in
+            gemini) K="$GEMINI_API_KEY" ;;
+            openai) K="$OPENAI_API_KEY" ;;
+            anthropic) K="$ANTHROPIC_API_KEY" ;;
+          esac
+          if [ -n "$K" ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "No $PROVIDER key secret configured - skipping"; fi
+      - uses: actions/checkout@v4
+        if: steps.key.outputs.present == 'true'
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.key.outputs.present == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.key.outputs.present == 'true'
+      - name: Run agent on a real task
+        if: steps.key.outputs.present == 'true'
+        run: |
+          cargo build --release
+          mkdir -p /tmp/live && cd /tmp/live
+          $GITHUB_WORKSPACE/target/release/blitz run --provider "$PROVIDER" --max-turns 8 \
+            "Create fib.py that prints the first 10 Fibonacci numbers separated by spaces, run it, and verify the output contains '0 1 1 2 3 5 8 13 21 34'."
+          python3 fib.py | grep -q "0 1 1 2 3 5 8 13 21 34"

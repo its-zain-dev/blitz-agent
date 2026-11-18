@@ -1,0 +1,28 @@
+[
+  {
+    "thought": "Explore in parallel. Predict that Cargo.toml exists and chain a search for TODOs.",
+    "steps": [
+      {"id": "ls", "tool": "list_dir", "args": {"path": "."}},
+      {"id": "manifest", "tool": "read_file", "args": {"path": "Cargo.toml", "end_line": 5},
+       "predict": [
+         {"when": {"contains": "[package]"}, "then": [
+           {"id": "todos", "tool": "search", "args": {"pattern": "TODO|FIXME", "path": "src"}}
+         ]}
+       ]},
+      {"id": "count", "tool": "bash", "args": {"cmd": "find src -name '*.rs' | wc -l"}}
+    ]
+  },
+  {
+    "thought": "Write a report, verify it, and finish optimistically.",
+    "steps": [
+      {"id": "report", "tool": "write_file",
+       "args": {"path": "demo_out/report.md", "content": "# Blitz report\nProject explored in one parallel turn.\n"},
+       "predict": [
+         {"when": {"success": true}, "then": [
+           {"id": "check", "tool": "bash", "args": {"cmd": "grep -c Blitz demo_out/report.md"},
+            "predict": [{"when": {"stdout_regex": "^1"}, "then": [], "finish": "Report written to demo_out/report.md"}]}
+         ]}
+       ]}
+    ]
+  }
+]

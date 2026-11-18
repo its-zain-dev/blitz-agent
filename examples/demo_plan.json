@@ -1,0 +1,24 @@
+{
+  "thought": "Demo: 4 parallel probes; the build step predicts its outcome and auto-chains a run + verify.",
+  "steps": [
+    {"id": "os", "tool": "bash", "args": {"cmd": "uname -a"}},
+    {"id": "slow1", "tool": "bash", "args": {"cmd": "sleep 1 && echo probe-1 done"}},
+    {"id": "slow2", "tool": "bash", "args": {"cmd": "sleep 1 && echo probe-2 done"}},
+    {"id": "write", "tool": "write_file",
+     "args": {"path": "demo_out/app.sh", "content": "#!/bin/sh\necho \"result: $((6 * 7))\"\n"},
+     "predict": [
+       {"when": {"success": true}, "then": [
+         {"id": "run", "tool": "bash", "args": {"cmd": "sh demo_out/app.sh"},
+          "predict": [
+            {"when": {"contains": "result: 42"}, "then": [
+              {"id": "verify", "tool": "bash", "args": {"cmd": "test -f demo_out/app.sh && echo verified"},
+               "predict": [{"when": {"contains": "verified"}, "then": [], "finish": "app.sh built, ran and verified"}]}
+            ]},
+            {"when": {}, "then": [
+              {"id": "debug", "tool": "read_file", "args": {"path": "demo_out/app.sh", "numbered": true}}
+            ]}
+          ]}
+       ]}
+     ]}
+  ]
+}
