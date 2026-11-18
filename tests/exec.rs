@@ -13,7 +13,8 @@ fn executor(dir: &std::path::Path, concurrency: usize) -> Executor {
 
 fn plan(json: &str) -> Plan {
     let mut p = Plan::parse(json).expect("parse");
-    p.validate(TOOL_NAMES, &Limits::default()).expect("validate");
+    p.validate(TOOL_NAMES, &Limits::default())
+        .expect("validate");
     p
 }
 
@@ -47,7 +48,11 @@ async fn concurrency_limit_is_respected() {
         ]}"#,
     );
     let r = executor(dir.path(), 1).run(&p.steps).await;
-    assert!(r.wall_ms >= 850, "should be serialized, took {} ms", r.wall_ms);
+    assert!(
+        r.wall_ms >= 850,
+        "should be serialized, took {} ms",
+        r.wall_ms
+    );
 }
 
 #[tokio::test]
@@ -138,9 +143,7 @@ async fn unpredicted_failure_is_not_clean() {
 #[tokio::test]
 async fn render_truncates_long_output() {
     let dir = tempfile::tempdir().unwrap();
-    let p = plan(
-        r#"{"steps": [{"id": "big", "tool": "bash", "args": {"cmd": "seq 1 100000"}}]}"#,
-    );
+    let p = plan(r#"{"steps": [{"id": "big", "tool": "bash", "args": {"cmd": "seq 1 100000"}}]}"#);
     let r = executor(dir.path(), 8).run(&p.steps).await;
     let text = r.render(2000);
     assert!(text.contains("bytes omitted"));

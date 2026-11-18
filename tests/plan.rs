@@ -50,10 +50,31 @@ fn enforces_depth_and_node_limits() {
     let deep = r#"{"steps": [{"tool": "list_dir", "predict": [{"when": {}, "then": [
         {"tool": "list_dir", "predict": [{"when": {}, "then": [{"tool": "list_dir"}]}]}
     ]}]}]}"#;
-    assert!(validate(deep, Limits { max_depth: 3, max_nodes: 64 }).is_ok());
-    let e = validate(deep, Limits { max_depth: 2, max_nodes: 64 }).unwrap_err();
+    assert!(validate(
+        deep,
+        Limits {
+            max_depth: 3,
+            max_nodes: 64
+        }
+    )
+    .is_ok());
+    let e = validate(
+        deep,
+        Limits {
+            max_depth: 2,
+            max_nodes: 64,
+        },
+    )
+    .unwrap_err();
     assert!(e.contains("too deep"));
-    let e = validate(deep, Limits { max_depth: 9, max_nodes: 2 }).unwrap_err();
+    let e = validate(
+        deep,
+        Limits {
+            max_depth: 9,
+            max_nodes: 2,
+        },
+    )
+    .unwrap_err();
     assert!(e.contains("too large"));
 }
 

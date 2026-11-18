@@ -9,10 +9,7 @@ use blitz::tools::ToolBox;
 
 fn agent(dir: &std::path::Path, responses: &[&str]) -> Agent {
     let llm = LlmClient::mock(responses.iter().map(|s| s.to_string()).collect());
-    let exec = Executor::new(
-        ToolBox::new(dir.to_path_buf(), Duration::from_secs(30)),
-        8,
-    );
+    let exec = Executor::new(ToolBox::new(dir.to_path_buf(), Duration::from_secs(30)), 8);
     Agent::new(llm, exec, AgentConfig::default())
 }
 
@@ -31,7 +28,10 @@ async fn predicted_task_finishes_in_one_turn() {
         {"id": "ls", "tool": "list_dir", "args": {"path": "."}}
       ]
     }"#;
-    let res = agent(dir.path(), &[plan]).run("make hello.sh").await.unwrap();
+    let res = agent(dir.path(), &[plan])
+        .run("make hello.sh")
+        .await
+        .unwrap();
     assert_eq!(res.answer.as_deref(), Some("hello.sh works"));
     assert_eq!(res.stats.llm_turns, 1);
     assert_eq!(res.stats.tool_calls, 3);

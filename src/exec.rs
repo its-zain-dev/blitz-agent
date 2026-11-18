@@ -136,8 +136,12 @@ impl Executor {
             let futs: Vec<_> = children
                 .into_iter()
                 .map(|c| {
-                    self.clone()
-                        .run_node(c, Some(parent_id.clone()), depth + 1, Arc::clone(&shared))
+                    self.clone().run_node(
+                        c,
+                        Some(parent_id.clone()),
+                        depth + 1,
+                        Arc::clone(&shared),
+                    )
                 })
                 .collect();
             join_all(futs).await;

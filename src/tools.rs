@@ -254,11 +254,7 @@ impl ToolBox {
         loop {
             match rd.next_entry().await {
                 Ok(Some(entry)) => {
-                    let is_dir = entry
-                        .file_type()
-                        .await
-                        .map(|t| t.is_dir())
-                        .unwrap_or(false);
+                    let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
                     let mut name = entry.file_name().to_string_lossy().into_owned();
                     if is_dir {
                         name.push('/');

@@ -168,7 +168,11 @@ impl LlmClient {
     async fn openai(&self, system: &str, msgs: &[Message]) -> Result<String> {
         let mut messages = vec![json!({"role": "system", "content": system})];
         for m in msgs {
-            let role = if m.role == Role::User { "user" } else { "assistant" };
+            let role = if m.role == Role::User {
+                "user"
+            } else {
+                "assistant"
+            };
             messages.push(json!({"role": role, "content": m.content}));
         }
         let mut body = json!({"model": self.model, "messages": messages});
@@ -193,7 +197,11 @@ impl LlmClient {
         let contents: Vec<Value> = msgs
             .iter()
             .map(|m| {
-                let role = if m.role == Role::User { "user" } else { "model" };
+                let role = if m.role == Role::User {
+                    "user"
+                } else {
+                    "model"
+                };
                 json!({"role": role, "parts": [{"text": m.content}]})
             })
             .collect();
@@ -235,7 +243,11 @@ impl LlmClient {
         let messages: Vec<Value> = msgs
             .iter()
             .map(|m| {
-                let role = if m.role == Role::User { "user" } else { "assistant" };
+                let role = if m.role == Role::User {
+                    "user"
+                } else {
+                    "assistant"
+                };
                 json!({"role": role, "content": m.content})
             })
             .collect();

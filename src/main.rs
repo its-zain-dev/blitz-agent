@@ -38,7 +38,13 @@ enum Cmd {
 struct RunArgs {
     /// The task description.
     task: String,
-    #[arg(short, long, value_enum, default_value = "gemini", env = "BLITZ_PROVIDER")]
+    #[arg(
+        short,
+        long,
+        value_enum,
+        default_value = "gemini",
+        env = "BLITZ_PROVIDER"
+    )]
     provider: ProviderKind,
     /// Model name (defaults depend on provider).
     #[arg(short, long, env = "BLITZ_MODEL")]
@@ -123,8 +129,8 @@ async fn run(a: RunArgs) -> Result<i32> {
             .mock_file
             .as_ref()
             .context("--mock-file is required with --provider mock")?;
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let items: Vec<serde_json::Value> =
             serde_json::from_str(&text).context("mock file must be a JSON array")?;
         LlmClient::mock(
@@ -137,7 +143,12 @@ async fn run(a: RunArgs) -> Result<i32> {
                 .collect(),
         )
     } else {
-        LlmClient::new(a.provider, a.model.clone(), a.base_url.clone(), !a.no_json_mode)?
+        LlmClient::new(
+            a.provider,
+            a.model.clone(),
+            a.base_url.clone(),
+            !a.no_json_mode,
+        )?
     };
 
     let exec = Executor::new(

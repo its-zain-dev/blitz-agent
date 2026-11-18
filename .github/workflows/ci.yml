@@ -24,7 +24,7 @@ jobs:
       - name: clippy
         if: success() || failure()
         run: cargo clippy --all-targets -- -D warnings
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: failure()
         with:
           name: fmt-patch
@@ -59,7 +59,7 @@ jobs:
         run: ./target/release/blitz run "explore this repo and write a report" --provider mock --mock-file examples/mock_session.json
       - name: Show system prompt
         run: ./target/release/blitz prompt | head -20
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: blitz-linux-x86_64
           path: target/release/blitz

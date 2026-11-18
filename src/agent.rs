@@ -109,7 +109,10 @@ impl Agent {
         let mut consecutive_errors = 0usize;
 
         for turn in 1..=self.cfg.max_turns {
-            self.log(format!("\n━━ turn {turn} ━━ asking {} ...", self.llm.model()));
+            self.log(format!(
+                "\n━━ turn {turn} ━━ asking {} ...",
+                self.llm.model()
+            ));
             let t0 = Instant::now();
             let reply = self.llm.complete(&system, &msgs).await?;
             stats.llm_turns += 1;
