@@ -115,10 +115,7 @@ fn describe_tool(tool: &str, args: &Value) -> (String, String) {
         "read_file" | "write_file" | "edit_file" | "list_dir" => {
             args.get("path").and_then(|v| v.as_str()).unwrap_or(".")
         }
-        "search" => args
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .unwrap_or(""),
+        "search" => args.get("pattern").and_then(|v| v.as_str()).unwrap_or(""),
         _ => "",
     };
     let single = raw.lines().next().unwrap_or("").trim();
@@ -187,9 +184,7 @@ fn parse_inline_markdown(prefix: &str, text: &str, base_style: Style) -> Line<'s
         spans.push(Span::styled(prefix.to_string(), base_style));
     }
     let mut rest = text;
-    let bold_style = base_style
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
+    let bold_style = base_style.fg(Color::White).add_modifier(Modifier::BOLD);
     while let Some(start) = rest.find("**") {
         if start > 0 {
             spans.push(Span::styled(rest[..start].to_string(), base_style));
@@ -464,9 +459,11 @@ impl TuiApp {
                     detail,
                     is_last_in_turn: false,
                 };
-                if let Some(pos) = self.entries.iter().rposition(|e| {
-                    matches!(e, ChatEntry::ToolRunning { id, .. } if *id == rec.id)
-                }) {
+                if let Some(pos) = self
+                    .entries
+                    .iter()
+                    .rposition(|e| matches!(e, ChatEntry::ToolRunning { id, .. } if *id == rec.id))
+                {
                     self.entries[pos] = done;
                 } else {
                     self.push_entry(done);
@@ -1033,8 +1030,9 @@ impl TuiApp {
                         Style::default().fg(Color::DarkGray),
                     )));
                     for (idx, raw) in text.lines().enumerate() {
-                        for (widx, part) in
-                            wrap_str(raw, width.saturating_sub(2)).into_iter().enumerate()
+                        for (widx, part) in wrap_str(raw, width.saturating_sub(2))
+                            .into_iter()
+                            .enumerate()
                         {
                             let prefix = if idx == 0 && widx == 0 { "> " } else { "  " };
                             lines.push(Line::from(vec![
@@ -1103,10 +1101,7 @@ impl TuiApp {
                                 .fg(Color::White)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(
-                            format!("({detail})"),
-                            Style::default().fg(Color::DarkGray),
-                        ),
+                        Span::styled(format!("({detail})"), Style::default().fg(Color::DarkGray)),
                     ]));
                 }
                 ChatEntry::ToolDone {
@@ -1352,14 +1347,8 @@ impl TuiApp {
         let rows: Vec<(&str, String)> = vec![
             ("Provider", format!("◀ {} ▶", self.cfg.provider.label())),
             ("Model", format!("◀ {} ▶", self.cfg.active_model())),
-            (
-                "Gemini Key",
-                AppConfig::mask_key(&self.cfg.gemini_api_key),
-            ),
-            (
-                "OpenAI Key",
-                AppConfig::mask_key(&self.cfg.openai_api_key),
-            ),
+            ("Gemini Key", AppConfig::mask_key(&self.cfg.gemini_api_key)),
+            ("OpenAI Key", AppConfig::mask_key(&self.cfg.openai_api_key)),
             (
                 "Anthropic Key",
                 AppConfig::mask_key(&self.cfg.anthropic_api_key),
@@ -1373,7 +1362,11 @@ impl TuiApp {
                 "Fast Finish",
                 format!(
                     "◀ {} ▶",
-                    if self.cfg.optimistic_finish { "ON" } else { "OFF" }
+                    if self.cfg.optimistic_finish {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
                 ),
             ),
             ("Concurrency", format!("◀ {}x ▶", self.cfg.concurrency)),
