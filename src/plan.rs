@@ -7,12 +7,15 @@ use serde_json::Value;
 
 use crate::condition::Condition;
 
-/// One model turn: parallel `steps`, each with optional predicted branches.
+/// One model turn: parallel `steps`, each with optional predicted branches,
+/// plus optional `after_all` branches evaluated once all parallel `steps` complete.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Plan {
     pub thought: Option<String>,
     pub steps: Vec<Node>,
+    /// Branches evaluated after all top-level parallel `steps` complete.
+    pub after_all: Vec<Branch>,
     /// Final answer. With empty `steps` the task ends now; with steps it is an
     /// optimistic finish accepted only if every prediction hits.
     pub finish: Option<String>,
@@ -70,6 +73,24 @@ impl Plan {
 
     /// Validate tools, ids, regexes and limits. Assigns ids to nodes that lack one.
     pub fn validate(&mut self, known_tools: &[&str], limits: &Limits) -> Result<(), String> {
+        // Normalize empty/whitespace `finish`: if `steps` is empty and `finish` is missing or
+        // blank, fall back to `thought` so a conversational reply in `thought` is never lost.
+        if self
+            .finish
+            .as_ref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(false)
+        {
+            self.finish = None;
+        }
+        if self.steps.is_empty() && self.finish.is_none() {
+            if let Some(t) = &self.thought {
+                if !t.trim().is_empty() {
+                    self.finish = Some(t.trim().to_string());
+                    self.thought = None;
+                }
+            }
+        }
         if self.steps.is_empty() && self.finish.is_none() {
             return Err("plan has no steps and no finish".into());
         }
@@ -79,10 +100,30 @@ impl Plan {
         for n in &self.steps {
             check_node(n, 0, known_tools, limits, &mut ids, &mut total)?;
         }
+        if self.after_all.len() > limits.max_branches {
+            return Err(format!(
+                "after_all: too many branches ({} > max {})",
+                self.after_all.len(),
+                limits.max_branches
+            ));
+        }
+        for (i, b) in self.after_all.iter().enumerate() {
+            b.when
+                .validate()
+                .map_err(|e| format!("after_all #{i}: {e}"))?;
+            for c in &b.then {
+                check_node(c, 1, known_tools, limits, &mut ids, &mut total)?;
+            }
+        }
         // Pass 2: give unnamed nodes ids that cannot collide with explicit ones.
         let mut counter = 0usize;
         for n in self.steps.iter_mut() {
             assign_ids(n, &mut ids, &mut counter);
+        }
+        for b in self.after_all.iter_mut() {
+            for c in b.then.iter_mut() {
+                assign_ids(c, &mut ids, &mut counter);
+            }
         }
         Ok(())
     }
@@ -97,7 +138,14 @@ impl Plan {
                 .map(count)
                 .sum::<usize>()
         }
-        self.steps.iter().map(count).sum()
+        let step_nodes: usize = self.steps.iter().map(count).sum();
+        let join_nodes: usize = self
+            .after_all
+            .iter()
+            .flat_map(|b| b.then.iter())
+            .map(count)
+            .sum();
+        step_nodes + join_nodes
     }
 }
 

@@ -1,4 +1,4 @@
-//! Full interactive Terminal UI (TUI) for Blitz (`ratatui` + `crossterm`).
+//! Clean, full-terminal, borderless TUI for Blitz (`ratatui` + `crossterm`).
 
 use std::io;
 use std::path::PathBuf;
@@ -10,14 +10,12 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Terminal;
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -32,35 +30,22 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 
 #[derive(Debug, Clone)]
 enum ChatEntry {
-    Banner,
+    Welcome,
     User(String),
-    TurnHeader {
-        turn: usize,
-        max_turns: usize,
-        model: String,
-    },
     Thought(String),
-    PlanInfo {
-        steps: usize,
-        total_nodes: usize,
-    },
     ToolRunning {
         id: String,
-        parent: Option<String>,
         depth: usize,
         tool: String,
-        args: String,
+        summary: String,
     },
     ToolDone(NodeRecord),
-    OptimisticFinish,
     TurnSummary {
-        turn: usize,
         tools: usize,
         chained: usize,
-        hits: usize,
-        misses: usize,
         wall_ms: u64,
         seq_ms: u64,
+        fast_finish: bool,
     },
     Assistant(String),
     Notice(String),
@@ -113,6 +98,72 @@ enum WorkerMsg {
     },
 }
 
+/// Extract a clean human-readable 1-line summary of tool args (no noisy JSON braces).
+fn clean_tool_summary(tool: &str, args: &Value) -> String {
+    let raw = match tool {
+        "bash" => args
+            .get("cmd")
+            .or_else(|| args.get("command"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        "read_file" | "write_file" | "edit_file" | "list_dir" => {
+            args.get("path").and_then(|v| v.as_str()).unwrap_or(".")
+        }
+        "search" => args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        _ => "",
+    };
+    let single_line = raw.lines().next().unwrap_or("").trim();
+    if single_line.is_empty() {
+        truncate_chars(&args.to_string(), 60)
+    } else {
+        truncate_chars(single_line, 60)
+    }
+}
+
+/// Word/character wrap a line to `max_cols` characters so 1 `Line` == 1 terminal row.
+fn wrap_str(s: &str, max_cols: usize) -> Vec<String> {
+    let width = max_cols.max(8);
+    if s.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut cur_len = 0usize;
+
+    for word in s.split_inclusive(' ') {
+        let wlen = word.chars().count();
+        if cur_len + wlen <= width {
+            cur.push_str(word);
+            cur_len += wlen;
+        } else if wlen > width {
+            for ch in word.chars() {
+                if cur_len >= width {
+                    out.push(std::mem::take(&mut cur));
+                    cur_len = 0;
+                }
+                cur.push(ch);
+                cur_len += 1;
+            }
+        } else {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            cur.push_str(word);
+            cur_len = wlen;
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 pub struct TuiApp {
     cfg: AppConfig,
     workdir: PathBuf,
@@ -131,6 +182,8 @@ pub struct TuiApp {
     editing_setting: Option<String>,
     running: Option<JoinHandle<()>>,
     running_label: String,
+    last_thought: Option<String>,
+    pending_fast_finish: bool,
     worker_rx: Option<mpsc::UnboundedReceiver<WorkerMsg>>,
     tick: usize,
     should_quit: bool,
@@ -138,10 +191,10 @@ pub struct TuiApp {
 
 impl TuiApp {
     pub fn new(cfg: AppConfig, workdir: PathBuf) -> Self {
-        let mut entries = vec![ChatEntry::Banner];
+        let mut entries = vec![ChatEntry::Welcome];
         if cfg.active_api_key().trim().is_empty() {
             entries.push(ChatEntry::Notice(format!(
-                "No API key set for {}. Press F2 (or type /settings or /key YOUR_KEY) to configure it.",
+                "No API key set for {}. Type /key YOUR_KEY or /settings (F2).",
                 cfg.provider.label()
             )));
         }
@@ -157,12 +210,14 @@ impl TuiApp {
             history_idx: None,
             scroll: 0,
             follow_bottom: true,
-            show_tool_output: true,
+            show_tool_output: false,
             show_settings: false,
             setting_idx: 0,
             editing_setting: None,
             running: None,
             running_label: String::new(),
+            last_thought: None,
+            pending_fast_finish: false,
             worker_rx: None,
             tick: 0,
             should_quit: false,
@@ -171,9 +226,7 @@ impl TuiApp {
 
     fn push_entry(&mut self, e: ChatEntry) {
         self.entries.push(e);
-        if self.follow_bottom {
-            self.scroll = u16::MAX;
-        }
+        self.follow_bottom = true;
     }
 
     fn save_cfg(&mut self) {
@@ -185,7 +238,7 @@ impl TuiApp {
     fn start_task(&mut self, task: String) {
         if self.running.is_some() {
             self.push_entry(ChatEntry::Notice(
-                "A task is already running. Press Esc or type /cancel to abort it first.".into(),
+                "Busy — press Esc or type /cancel to stop the current task.".into(),
             ));
             return;
         }
@@ -198,6 +251,8 @@ impl TuiApp {
             }
         };
 
+        self.last_thought = None;
+        self.pending_fast_finish = false;
         self.push_entry(ChatEntry::User(task.clone()));
         let (tx, rx) = mpsc::unbounded_channel();
         let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
@@ -225,7 +280,7 @@ impl TuiApp {
             events: Some(agent_tx),
         };
         let mut history = self.history.clone();
-        self.running_label = format!("Starting ({}) ...", self.cfg.active_model());
+        self.running_label = "thinking...".into();
         self.worker_rx = Some(rx);
         self.running = Some(tokio::spawn(async move {
             let t0 = Instant::now();
@@ -247,7 +302,7 @@ impl TuiApp {
             h.abort();
             self.worker_rx = None;
             self.running_label.clear();
-            self.push_entry(ChatEntry::Notice("⏹ Task cancelled by user.".into()));
+            self.push_entry(ChatEntry::Notice("Stopped.".into()));
         }
     }
 
@@ -273,10 +328,14 @@ impl TuiApp {
                     match result {
                         Ok(res) => {
                             self.stats.merge(&res.stats);
-                            match res.answer {
-                                Some(ans) => self.push_entry(ChatEntry::Assistant(ans)),
+                            let ans = res
+                                .answer
+                                .filter(|a| !a.trim().is_empty())
+                                .or_else(|| self.last_thought.take());
+                            match ans {
+                                Some(text) => self.push_entry(ChatEntry::Assistant(text)),
                                 None => self.push_entry(ChatEntry::Notice(format!(
-                                    "Stopped after reaching max turns ({}) in {:.1}s.",
+                                    "Reached max turns ({}) in {:.1}s.",
                                     self.cfg.max_turns,
                                     elapsed_ms as f64 / 1000.0
                                 ))),
@@ -291,76 +350,64 @@ impl TuiApp {
 
     fn on_agent_event(&mut self, ev: AgentEvent) {
         match ev {
-            AgentEvent::TurnStarted {
-                turn,
-                max_turns,
-                model,
-            } => {
-                self.running_label = format!("Turn {turn}/{max_turns} • thinking ({model})...");
-                self.push_entry(ChatEntry::TurnHeader {
-                    turn,
-                    max_turns,
-                    model,
-                });
+            AgentEvent::TurnStarted { turn, .. } => {
+                self.running_label = if turn == 1 {
+                    "thinking...".into()
+                } else {
+                    format!("turn {turn} · thinking...")
+                };
             }
             AgentEvent::Thought(t) => {
+                self.last_thought = Some(t.clone());
                 self.push_entry(ChatEntry::Thought(t));
             }
             AgentEvent::PlanReady { steps, total_nodes } => {
-                self.running_label =
-                    format!("Executing {steps} parallel step(s) ({total_nodes} nodes)...");
-                self.push_entry(ChatEntry::PlanInfo { steps, total_nodes });
+                self.running_label = format!("running {steps} parallel ({total_nodes} total)...");
             }
             AgentEvent::Exec(ExecEvent::NodeStarted {
                 id,
-                parent,
                 depth,
                 tool,
                 args,
+                ..
             }) => {
-                self.running_label = format!("Running [{id}] {tool}...");
+                let summary = clean_tool_summary(&tool, &args);
+                self.running_label = format!("{tool} {summary}");
                 self.push_entry(ChatEntry::ToolRunning {
                     id,
-                    parent,
                     depth,
                     tool,
-                    args: truncate_chars(&args.to_string(), 110),
+                    summary,
                 });
             }
             AgentEvent::Exec(ExecEvent::NodeFinished(rec)) => {
-                if let Some(pos) = self
-                    .entries
-                    .iter()
-                    .rposition(|e| matches!(e, ChatEntry::ToolRunning { id, .. } if *id == rec.id))
-                {
+                if let Some(pos) = self.entries.iter().rposition(|e| {
+                    matches!(e, ChatEntry::ToolRunning { id, .. } if *id == rec.id)
+                }) {
                     self.entries[pos] = ChatEntry::ToolDone(rec);
                 } else {
                     self.push_entry(ChatEntry::ToolDone(rec));
                 }
-                if self.follow_bottom {
-                    self.scroll = u16::MAX;
+                self.follow_bottom = true;
+            }
+            AgentEvent::OptimisticFinish => {
+                self.pending_fast_finish = true;
+                if let Some(ChatEntry::TurnSummary { fast_finish, .. }) = self.entries.last_mut() {
+                    *fast_finish = true;
                 }
             }
-            AgentEvent::TurnReport {
-                turn,
-                report,
-                stats: _,
-            } => {
+            AgentEvent::TurnReport { report, .. } => {
+                let fast = std::mem::take(&mut self.pending_fast_finish);
                 self.push_entry(ChatEntry::TurnSummary {
-                    turn,
                     tools: report.tool_calls(),
                     chained: report.chained(),
-                    hits: report.hits(),
-                    misses: report.misses(),
                     wall_ms: report.wall_ms,
                     seq_ms: report.tool_ms(),
+                    fast_finish: fast,
                 });
             }
             AgentEvent::ParseError(e) => {
-                self.push_entry(ChatEntry::Error(format!("Plan validation warning: {e}")));
-            }
-            AgentEvent::OptimisticFinish => {
-                self.push_entry(ChatEntry::OptimisticFinish);
+                self.push_entry(ChatEntry::Error(format!("Retrying plan: {e}")));
             }
         }
     }
@@ -409,7 +456,7 @@ impl TuiApp {
                 }
                 self.save_cfg();
                 self.push_entry(ChatEntry::Notice(format!(
-                    "Provider switched to {} (model: {})",
+                    "Provider: {} ({})",
                     self.cfg.provider.label(),
                     self.cfg.active_model()
                 )));
@@ -422,8 +469,7 @@ impl TuiApp {
                 }
                 self.save_cfg();
                 self.push_entry(ChatEntry::Notice(format!(
-                    "Active model for {} set to '{}'",
-                    self.cfg.provider.label(),
+                    "Model: {}",
                     self.cfg.active_model()
                 )));
             }
@@ -439,7 +485,7 @@ impl TuiApp {
                     self.cfg.set_active_api_key(arg.to_string());
                     self.save_cfg();
                     self.push_entry(ChatEntry::Notice(format!(
-                        "Saved API key for {} ({})",
+                        "Saved {} key ({})",
                         self.cfg.provider.label(),
                         AppConfig::mask_key(self.cfg.active_api_key())
                     )));
@@ -466,7 +512,7 @@ impl TuiApp {
                 }
                 self.save_cfg();
                 self.push_entry(ChatEntry::Notice(format!(
-                    "Guessing mode: {}",
+                    "Guess mode: {}",
                     self.cfg.guess_mode.label()
                 )));
             }
@@ -475,7 +521,7 @@ impl TuiApp {
                     self.cfg.max_depth = d.clamp(1, 8);
                     self.save_cfg();
                     self.push_entry(ChatEntry::Notice(format!(
-                        "Max prediction depth set to {}",
+                        "Max guess depth: {}",
                         self.cfg.max_depth
                     )));
                 } else {
@@ -485,31 +531,24 @@ impl TuiApp {
             "/output" | "/o" => {
                 self.show_tool_output = !self.show_tool_output;
                 self.push_entry(ChatEntry::Notice(format!(
-                    "Tool output preview in chat: {}",
-                    if self.show_tool_output { "ON" } else { "OFF" }
+                    "Tool stdout logs: {}",
+                    if self.show_tool_output { "shown" } else { "hidden" }
                 )));
             }
             "/cancel" | "/stop" => self.cancel_running(),
             "/clear" | "/reset" => {
                 self.entries.clear();
                 self.history.clear();
-                self.entries.push(ChatEntry::Banner);
+                self.entries.push(ChatEntry::Welcome);
                 self.scroll = 0;
                 self.follow_bottom = true;
             }
             "/help" | "/h" | "/?" => {
                 self.push_entry(ChatEntry::Notice(
-                    "Commands:\n\
-                     • /settings (or F2)      Open full interactive Settings menu\n\
-                     • /provider [name]       Cycle or set provider (gemini, openai, anthropic)\n\
-                     • /model [name]          Cycle presets or set custom model name\n\
-                     • /key <api_key>         Save API key for active provider\n\
-                     • /guess [mode]          Cycle or set guessing (aggressive, balanced, conservative, off)\n\
-                     • /depth <1-8>           Set max prediction tree depth\n\
-                     • /output                Toggle tool stdout/stderr previews in chat\n\
-                     • /cancel (or Esc)       Stop the currently running task\n\
-                     • /clear                 Clear chat & conversation memory\n\
-                     • /quit (or Ctrl+C)      Exit Blitz"
+                    "/settings (F2)  Open settings       /provider [name]  Switch API\n\
+                     /model [name]   Switch model        /key <api_key>    Save API key\n\
+                     /guess [mode]   Guessing policy     /output (Ctrl+O)  Toggle tool logs\n\
+                     /clear          Reset conversation  /quit (Ctrl+C)    Exit"
                         .into(),
                 ));
             }
@@ -518,7 +557,7 @@ impl TuiApp {
             }
             other => {
                 self.push_entry(ChatEntry::Error(format!(
-                    "Unknown command '{other}'. Type /help for commands or /settings to open Settings."
+                    "Unknown command '{other}' — type /help or /settings"
                 )));
             }
         }
@@ -799,300 +838,188 @@ impl TuiApp {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
-                Constraint::Min(6),
-                Constraint::Length(3),
                 Constraint::Length(1),
+                Constraint::Min(4),
+                Constraint::Length(2),
             ])
             .split(f.area());
 
-        self.draw_header(f, chunks[0]);
-        self.draw_chat(f, chunks[1]);
-        self.draw_input(f, chunks[2]);
-        self.draw_footer(f, chunks[3]);
+        self.draw_top_bar(f, chunks[0]);
+        self.draw_chat_canvas(f, chunks[1]);
+        self.draw_bottom_prompt(f, chunks[2]);
 
         if self.show_settings {
             self.draw_settings_modal(f, f.area());
         }
     }
 
-    fn draw_header(&self, f: &mut ratatui::Frame, area: Rect) {
+    fn draw_top_bar(&self, f: &mut ratatui::Frame, area: Rect) {
         let spinner = SPINNER[self.tick % SPINNER.len()];
-        let status_span = if self.running.is_some() {
+        let mut spans = vec![
             Span::styled(
-                format!(" {spinner} {} ", self.running_label),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(
-                " ● READY ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            )
-        };
-
-        let line = Line::from(vec![
-            Span::styled(
-                " ⚡ BLITZ ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                format!(
-                    " {} • {} ",
-                    self.cfg.provider.short(),
-                    self.cfg.active_model()
-                ),
+                "⚡ blitz ",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("│ "),
             Span::styled(
-                format!(
-                    "GUESS: {} (depth {}, {} br) ",
-                    self.cfg.guess_mode.short(),
-                    self.cfg.max_depth,
-                    self.cfg.max_branches
-                ),
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
+                self.cfg.active_model().to_string(),
+                Style::default().fg(Color::White),
             ),
-            Span::raw("│ "),
+            Span::styled(" · ", Style::default().fg(Color::DarkGray)),
             Span::styled(
+                format!("guess:{}", self.cfg.guess_mode.short().to_lowercase()),
+                Style::default().fg(Color::Magenta),
+            ),
+        ];
+
+        if self.running.is_some() {
+            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                format!("{spinner} {}", self.running_label),
+                Style::default().fg(Color::Yellow),
+            ));
+        } else if self.stats.tool_calls > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
                 format!(
-                    "turns:{} tools:{} chained:{} hits:{}/{} ({:.1}x) ",
-                    self.stats.llm_turns,
+                    "{} tools ({} guessed) {:.1}x",
                     self.stats.tool_calls,
                     self.stats.chained,
-                    self.stats.hits,
-                    self.stats.hits + self.stats.misses,
                     self.stats.parallel_speedup()
                 ),
-                Style::default().fg(Color::Gray),
-            ),
-            status_span,
-        ]);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(
-                format!(" {} ", self.workdir.display()),
                 Style::default().fg(Color::DarkGray),
             ));
-        f.render_widget(Paragraph::new(line).block(block), area);
+        }
+
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    fn draw_chat(&mut self, f: &mut ratatui::Frame, area: Rect) {
+    fn draw_chat_canvas(&mut self, f: &mut ratatui::Frame, area: Rect) {
+        let width = area.width as usize;
         let mut lines: Vec<Line> = Vec::new();
         let spinner = SPINNER[self.tick % SPINNER.len()];
 
         for entry in &self.entries {
             match entry {
-                ChatEntry::Banner => {
+                ChatEntry::Welcome => {
                     lines.push(Line::from(vec![
                         Span::styled(
-                            "⚡ Blitz Autonomous Speculative Agent",
+                            "⚡ blitz",
                             Style::default()
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
-                            " — Parallel Tool Execution + Automatic Branch Prediction",
-                            Style::default().fg(Color::Gray),
-                        ),
-                    ]));
-                    lines.push(Line::from(vec![
-                        Span::styled("   • Press ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(
-                            "F2",
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(" or type ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(
-                            "/settings",
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            " to configure Provider, Model, API Keys, and Guessing Mode.",
+                            " — parallel & speculative agent  (/settings · /model · /guess · /help)",
                             Style::default().fg(Color::DarkGray),
                         ),
                     ]));
-                    lines.push(Line::from(""));
                 }
                 ChatEntry::User(text) => {
                     lines.push(Line::from(""));
-                    for (i, l) in text.lines().enumerate() {
-                        let prefix = if i == 0 { "❯ You: " } else { "       " };
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                prefix,
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                l.to_string(),
-                                Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
+                    for (idx, raw) in text.lines().enumerate() {
+                        let wrapped = wrap_str(raw, width.saturating_sub(2));
+                        for (widx, part) in wrapped.into_iter().enumerate() {
+                            let prefix = if idx == 0 && widx == 0 { "❯ " } else { "  " };
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    prefix,
+                                    Style::default()
+                                        .fg(Color::Cyan)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    part,
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                            ]));
+                        }
                     }
-                }
-                ChatEntry::TurnHeader {
-                    turn,
-                    max_turns,
-                    model,
-                } => {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("  ━━ Turn {turn}/{max_turns} • {model} ━━"),
-                        Style::default().fg(Color::DarkGray),
-                    )]));
                 }
                 ChatEntry::Thought(t) => {
-                    for (i, l) in t.lines().enumerate() {
-                        let prefix = if i == 0 { "  💭 " } else { "     " };
-                        lines.push(Line::from(vec![
-                            Span::styled(prefix, Style::default().fg(Color::Yellow)),
-                            Span::styled(
-                                l.to_string(),
-                                Style::default()
-                                    .fg(Color::Yellow)
-                                    .add_modifier(Modifier::ITALIC),
-                            ),
-                        ]));
-                    }
-                }
-                ChatEntry::PlanInfo { steps, total_nodes } => {
-                    let extra = total_nodes.saturating_sub(*steps);
+                    let one_line = t.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let clipped = truncate_chars(&one_line, width.saturating_sub(5));
                     lines.push(Line::from(vec![
-                        Span::styled("  ⚡ ", Style::default().fg(Color::Magenta)),
+                        Span::styled("  💭 ", Style::default().fg(Color::DarkGray)),
                         Span::styled(
-                            format!(
-                                "Plan: {steps} parallel step(s) + {extra} predicted branch node(s)"
-                            ),
-                            Style::default().fg(Color::Magenta),
+                            clipped,
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
                         ),
                     ]));
                 }
                 ChatEntry::ToolRunning {
-                    id,
-                    parent,
                     depth,
                     tool,
-                    args,
+                    summary,
+                    ..
                 } => {
-                    let indent = "    ".repeat(*depth);
-                    let via = parent
-                        .as_ref()
-                        .map(|p| format!("↳ (chained from {p}) "))
-                        .unwrap_or_default();
+                    let indent = "  ".repeat(depth + 1);
+                    let max_s = width.saturating_sub(indent.len() + tool.len() + 6);
                     lines.push(Line::from(vec![
-                        Span::raw(format!("  {indent}")),
+                        Span::raw(indent),
                         Span::styled(format!("{spinner} "), Style::default().fg(Color::Yellow)),
-                        Span::styled(via, Style::default().fg(Color::Magenta)),
                         Span::styled(
-                            format!("[{id}] {tool} "),
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
+                            format!("{tool} "),
+                            Style::default().fg(Color::Cyan),
                         ),
-                        Span::styled(args.clone(), Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            truncate_chars(summary, max_s),
+                            Style::default().fg(Color::DarkGray),
+                        ),
                     ]));
                 }
                 ChatEntry::ToolDone(r) => {
-                    let indent = "    ".repeat(r.depth);
-                    let tree = if r.depth > 0 { "↳ ⚡ " } else { "• " };
-                    let (status_badge, status_color) = if r.output.success() {
-                        (
-                            format!("✓ exit 0 ({}ms)", r.output.duration_ms),
-                            Color::Green,
-                        )
+                    let indent = "  ".repeat(r.depth + 1);
+                    let (icon, icon_color) = if r.output.success() {
+                        ("✓", Color::Green)
                     } else {
-                        (
-                            format!("✗ exit {} ({}ms)", r.output.exit_code, r.output.duration_ms),
-                            Color::Red,
-                        )
+                        ("✗", Color::Red)
                     };
-                    let outcome_span = match &r.outcome {
-                        Outcome::NoPrediction => Span::raw(""),
-                        Outcome::Hit { branch, spawned } => {
-                            if spawned.is_empty() {
-                                Span::styled(
-                                    format!("  ✔ GUESS HIT #{branch}"),
-                                    Style::default()
-                                        .fg(Color::Green)
-                                        .add_modifier(Modifier::BOLD),
-                                )
-                            } else {
-                                Span::styled(
-                                    format!(
-                                        "  ✔ GUESS HIT #{branch} → auto-ran [{}]",
-                                        spawned.join(", ")
-                                    ),
-                                    Style::default()
-                                        .fg(Color::LightGreen)
-                                        .add_modifier(Modifier::BOLD),
-                                )
-                            }
+                    let chain_tag = if r.depth > 0 { "↳ " } else { "" };
+                    let summary = clean_tool_summary(&r.tool, &r.args);
+                    let guess_tag = match &r.outcome {
+                        Outcome::Hit { spawned, .. } if !spawned.is_empty() => {
+                            format!("  ⚡→ {}", spawned.join(","))
                         }
-                        Outcome::Miss { predictions } => Span::styled(
-                            format!("  ✘ GUESS MISS (0/{predictions})"),
-                            Style::default().fg(Color::Yellow),
-                        ),
+                        Outcome::Miss { .. } => "  (miss)".into(),
+                        _ => String::new(),
                     };
-
+                    let max_s = width.saturating_sub(
+                        indent.len() + chain_tag.len() + r.tool.len() + guess_tag.len() + 14,
+                    );
                     lines.push(Line::from(vec![
-                        Span::raw(format!("  {indent}")),
-                        Span::styled(tree, Style::default().fg(Color::Magenta)),
+                        Span::raw(indent.clone()),
+                        Span::styled(chain_tag, Style::default().fg(Color::Magenta)),
+                        Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
                         Span::styled(
-                            format!("[{}] {} ", r.id, r.tool),
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
+                            format!("{} ", r.tool),
+                            Style::default().fg(Color::Cyan),
                         ),
                         Span::styled(
-                            format!("{} ", truncate_chars(&r.args.to_string(), 75)),
+                            format!("{} ", truncate_chars(&summary, max_s)),
                             Style::default().fg(Color::Gray),
                         ),
-                        Span::styled(status_badge, Style::default().fg(status_color)),
-                        outcome_span,
+                        Span::styled(
+                            format!("{}ms", r.output.duration_ms),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(guess_tag, Style::default().fg(Color::LightGreen)),
                     ]));
 
                     if self.show_tool_output {
                         let out = r.output.display();
                         let trimmed = out.trim();
                         if !trimmed.is_empty() {
-                            for l in trimmed.lines().take(4) {
+                            for l in trimmed.lines().take(3) {
                                 lines.push(Line::from(vec![
-                                    Span::raw(format!("    {indent}│ ")),
+                                    Span::raw(format!("{indent}  │ ")),
                                     Span::styled(
-                                        truncate_chars(l, 120),
-                                        Style::default().fg(Color::DarkGray),
-                                    ),
-                                ]));
-                            }
-                            let total_lines = trimmed.lines().count();
-                            if total_lines > 4 {
-                                lines.push(Line::from(vec![
-                                    Span::raw(format!("    {indent}│ ")),
-                                    Span::styled(
-                                        format!("... (+{} more lines)", total_lines - 4),
+                                        truncate_chars(l, width.saturating_sub(indent.len() + 6)),
                                         Style::default().fg(Color::DarkGray),
                                     ),
                                 ]));
@@ -1100,248 +1027,174 @@ impl TuiApp {
                         }
                     }
                 }
-                ChatEntry::OptimisticFinish => {
-                    lines.push(Line::from(vec![Span::styled(
-                        "  🏁 Predictions held — finished immediately without another LLM round trip!",
-                        Style::default()
-                            .fg(Color::LightGreen)
-                            .add_modifier(Modifier::BOLD),
-                    )]));
-                }
                 ChatEntry::TurnSummary {
-                    turn,
                     tools,
                     chained,
-                    hits,
-                    misses,
                     wall_ms,
                     seq_ms,
+                    fast_finish,
                 } => {
                     let speedup = if *wall_ms > 0 {
                         (*seq_ms as f64 / *wall_ms as f64).max(1.0)
                     } else {
                         1.0
                     };
+                    let ff = if *fast_finish { " · instant finish" } else { "" };
                     lines.push(Line::from(vec![Span::styled(
                         format!(
-                            "  📊 Turn {turn}: {tools} tool(s), {chained} auto-chained, {hits} hit / {misses} miss • {wall_ms}ms wall vs {seq_ms}ms seq ({speedup:.1}x)"
+                            "  ⚡ {tools} tools ({chained} auto-chained) · {wall_ms}ms ({speedup:.1}x){ff}"
                         ),
                         Style::default().fg(Color::DarkGray),
                     )]));
                 }
                 ChatEntry::Assistant(ans) => {
                     lines.push(Line::from(""));
-                    lines.push(Line::from(vec![Span::styled(
-                        "⚡ Blitz:",
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    )]));
-                    for l in ans.lines() {
-                        lines.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled(l.to_string(), Style::default().fg(Color::White)),
-                        ]));
+                    for raw in ans.lines() {
+                        for part in wrap_str(raw, width.saturating_sub(1)) {
+                            lines.push(Line::from(Span::styled(
+                                part,
+                                Style::default().fg(Color::White),
+                            )));
+                        }
                     }
-                    lines.push(Line::from(""));
                 }
                 ChatEntry::Notice(msg) => {
-                    for l in msg.lines() {
-                        lines.push(Line::from(vec![
-                            Span::styled("  ℹ ", Style::default().fg(Color::Cyan)),
-                            Span::styled(l.to_string(), Style::default().fg(Color::Cyan)),
-                        ]));
+                    for raw in msg.lines() {
+                        for part in wrap_str(raw, width.saturating_sub(3)) {
+                            lines.push(Line::from(vec![
+                                Span::styled("· ", Style::default().fg(Color::Cyan)),
+                                Span::styled(part, Style::default().fg(Color::Cyan)),
+                            ]));
+                        }
                     }
                 }
                 ChatEntry::Error(err) => {
-                    for l in err.lines() {
-                        lines.push(Line::from(vec![
-                            Span::styled("  ⚠ ", Style::default().fg(Color::Red)),
-                            Span::styled(l.to_string(), Style::default().fg(Color::LightRed)),
-                        ]));
+                    for raw in err.lines() {
+                        for part in wrap_str(raw, width.saturating_sub(3)) {
+                            lines.push(Line::from(vec![
+                                Span::styled("! ", Style::default().fg(Color::Red)),
+                                Span::styled(part, Style::default().fg(Color::LightRed)),
+                            ]));
+                        }
                     }
                 }
             }
         }
 
-        let inner_height = area.height.saturating_sub(2) as usize;
+        let view_height = area.height as usize;
         let total = lines.len();
-        let max_scroll = total.saturating_sub(inner_height) as u16;
+        let max_scroll = total.saturating_sub(view_height) as u16;
         if self.follow_bottom || self.scroll >= max_scroll {
             self.scroll = max_scroll;
             self.follow_bottom = true;
         }
 
-        let chat_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(
-                " Conversation & Speculative Execution Tree ",
-                Style::default().fg(Color::Gray),
-            ));
-
-        let paragraph = Paragraph::new(lines)
-            .block(chat_block)
-            .wrap(Wrap { trim: false })
-            .scroll((self.scroll, 0));
+        let paragraph = Paragraph::new(lines).scroll((self.scroll, 0));
         f.render_widget(paragraph, area);
-
-        let mut scrollbar_state = ScrollbarState::new(total).position(self.scroll as usize);
-        f.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            area,
-            &mut scrollbar_state,
-        );
     }
 
-    fn draw_input(&self, f: &mut ratatui::Frame, area: Rect) {
-        let title = if self.running.is_some() {
-            " Running... (Press Esc or /cancel to stop) "
+    fn draw_bottom_prompt(&self, f: &mut ratatui::Frame, area: Rect) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(area);
+
+        let rule_width = area.width as usize;
+        let hint = if self.running.is_some() {
+            " Esc to stop "
         } else {
-            " Prompt (Enter to run • /settings or F2 for Settings • /help for commands) "
+            " /settings · /help "
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(if self.show_settings {
-                Color::DarkGray
-            } else {
-                Color::Cyan
-            }))
-            .title(Span::styled(title, Style::default().fg(Color::Cyan)));
-        let p = Paragraph::new(format!("❯ {}", self.input)).block(block);
-        f.render_widget(p, area);
+        let rule_len = rule_width.saturating_sub(hint.len());
+        let rule_line = Line::from(vec![
+            Span::styled("─".repeat(rule_len), Style::default().fg(Color::DarkGray)),
+            Span::styled(hint, Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(rule_line), rows[0]);
+
+        let prompt_line = if self.input.is_empty() && self.running.is_none() {
+            Line::from(vec![
+                Span::styled(
+                    "❯ ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "Ask anything or type /settings...",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(
+                    "❯ ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(self.input.clone(), Style::default().fg(Color::White)),
+            ])
+        };
+        f.render_widget(Paragraph::new(prompt_line), rows[1]);
 
         if !self.show_settings {
-            let x = (area.x + 3 + self.input[..self.cursor].chars().count() as u16)
-                .min(area.x + area.width.saturating_sub(2));
-            let y = area.y + 1;
+            let x = (rows[1].x + 2 + self.input[..self.cursor].chars().count() as u16)
+                .min(rows[1].x + rows[1].width.saturating_sub(1));
+            let y = rows[1].y;
             f.set_cursor_position((x, y));
         }
     }
 
-    fn draw_footer(&self, f: &mut ratatui::Frame, area: Rect) {
-        let line = Line::from(vec![
-            Span::styled(
-                " F2",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(":Settings  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("/provider", Style::default().fg(Color::Yellow)),
-            Span::styled(":Switch API  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("/model", Style::default().fg(Color::Yellow)),
-            Span::styled(":Switch Model  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("/guess", Style::default().fg(Color::Yellow)),
-            Span::styled(":Guess Mode  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Ctrl+O", Style::default().fg(Color::Yellow)),
-            Span::styled(":Toggle Logs  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("PgUp/PgDn", Style::default().fg(Color::Yellow)),
-            Span::styled(":Scroll  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Ctrl+C", Style::default().fg(Color::Yellow)),
-            Span::styled(":Quit", Style::default().fg(Color::DarkGray)),
-        ]);
-        f.render_widget(Paragraph::new(line), area);
-    }
-
     fn draw_settings_modal(&self, f: &mut ratatui::Frame, area: Rect) {
-        let w = area.width.saturating_sub(6).min(82);
-        let h = area.height.saturating_sub(2).min(23);
+        let w = area.width.saturating_sub(2).min(76);
+        let h = area.height.saturating_sub(2).min(21);
         let x = area.x + (area.width.saturating_sub(w)) / 2;
         let y = area.y + (area.height.saturating_sub(h)) / 2;
         let modal = Rect::new(x, y, w, h);
 
         f.render_widget(Clear, modal);
 
-        let rows: Vec<(&str, String, &str)> = vec![
+        let rows: Vec<(&str, String)> = vec![
+            ("Provider", format!("◀ {} ▶", self.cfg.provider.label())),
+            ("Model", format!("◀ {} ▶", self.cfg.active_model())),
             (
-                "Provider",
-                format!("◀ {} ▶", self.cfg.provider.label()),
-                "←/→ cycle (Gemini, OpenAI, Anthropic)",
-            ),
-            (
-                "Active Model",
-                format!("◀ {} ▶", self.cfg.active_model()),
-                "←/→ presets • Enter to type custom model",
-            ),
-            (
-                "Gemini API Key",
+                "Gemini Key",
                 AppConfig::mask_key(&self.cfg.gemini_api_key),
-                "Enter to paste/edit GEMINI_API_KEY",
             ),
             (
-                "OpenAI API Key",
+                "OpenAI Key",
                 AppConfig::mask_key(&self.cfg.openai_api_key),
-                "Enter to paste/edit OPENAI_API_KEY",
             ),
             (
-                "Anthropic API Key",
+                "Anthropic Key",
                 AppConfig::mask_key(&self.cfg.anthropic_api_key),
-                "Enter to paste/edit ANTHROPIC_API_KEY",
             ),
+            ("Base URL", self.cfg.active_base_url().to_string()),
+            ("Guess Mode", format!("◀ {} ▶", self.cfg.guess_mode.short())),
+            ("Guess Depth", format!("◀ {} ▶", self.cfg.max_depth)),
+            ("Max Branches", format!("◀ {} ▶", self.cfg.max_branches)),
+            ("Max Nodes", format!("◀ {} ▶", self.cfg.max_nodes)),
             (
-                "Provider Base URL",
-                self.cfg.active_base_url().to_string(),
-                "Enter to edit endpoint (OpenRouter, Groq, etc.)",
-            ),
-            (
-                "Guessing Mode",
-                format!("◀ {} ▶", self.cfg.guess_mode.label()),
-                "←/→ cycle automatic prediction aggressiveness",
-            ),
-            (
-                "Max Guess Depth",
-                format!("◀ {} levels ▶", self.cfg.max_depth),
-                "←/→ max nested prediction steps per turn (1..8)",
-            ),
-            (
-                "Max Branches / Tool",
-                format!("◀ {} branches ▶", self.cfg.max_branches),
-                "←/→ max predicted outcomes per tool call (1..6)",
-            ),
-            (
-                "Max Nodes / Plan",
-                format!("◀ {} nodes ▶", self.cfg.max_nodes),
-                "←/→ max total nodes in one turn's execution tree",
-            ),
-            (
-                "Optimistic Finish",
+                "Fast Finish",
                 format!(
                     "◀ {} ▶",
-                    if self.cfg.optimistic_finish {
-                        "ON"
-                    } else {
-                        "OFF"
-                    }
+                    if self.cfg.optimistic_finish { "ON" } else { "OFF" }
                 ),
-                "Finish inside a prediction branch without an extra turn",
             ),
+            ("Concurrency", format!("◀ {}x ▶", self.cfg.concurrency)),
+            ("Max Turns", format!("◀ {} ▶", self.cfg.max_turns)),
+            ("Timeout", format!("◀ {}s ▶", self.cfg.timeout_secs)),
             (
-                "Parallel Concurrency",
-                format!("◀ {} tools ▶", self.cfg.concurrency),
-                "←/→ max tools running at the same instant",
-            ),
-            (
-                "Max Turns / Task",
-                format!("◀ {} turns ▶", self.cfg.max_turns),
-                "←/→ safety cap on LLM turns per task",
-            ),
-            (
-                "Bash Timeout",
-                format!("◀ {} secs ▶", self.cfg.timeout_secs),
-                "←/→ default timeout per shell command",
-            ),
-            (
-                "Strict JSON Mode",
+                "JSON Mode",
                 format!("◀ {} ▶", if self.cfg.json_mode { "ON" } else { "OFF" }),
-                "←/→ provider response_format JSON enforcement",
             ),
         ];
 
         let items: Vec<ListItem> = rows
             .iter()
             .enumerate()
-            .map(|(i, (label, val, _hint))| {
+            .map(|(i, (label, val))| {
                 let selected = i == self.setting_idx;
                 let shown_val = if selected {
                     if let Some(edit_buf) = &self.editing_setting {
@@ -1362,45 +1215,28 @@ impl TuiApp {
                     Style::default().fg(Color::White)
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{marker}{label:<21} "), style),
-                    Span::styled(format!("{shown_val:<48}"), style),
+                    Span::styled(format!("{marker}{label:<15} "), style),
+                    Span::styled(shown_val, style),
                 ]))
             })
             .collect();
 
-        let inner = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(10), Constraint::Length(3)])
-            .split(modal);
-
+        let title = if self.editing_setting.is_some() {
+            " Settings • Type value & press Enter (Esc cancel) "
+        } else {
+            " Settings • ↑/↓ Select • ←/→ Change • Enter Edit • Esc Close "
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
             .title(Span::styled(
-                " ⚙ Blitz Settings (Auto-saved to ~/.config/blitz/config.toml) ",
+                title,
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ));
 
-        f.render_widget(List::new(items).block(block), inner[0]);
-
-        let hint = if self.editing_setting.is_some() {
-            "Typing new value... Press Enter to save or Esc to cancel."
-        } else {
-            rows.get(self.setting_idx).map(|(_, _, h)| *h).unwrap_or("")
-        };
-        let hint_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(" ↑/↓ Select • ←/→ Adjust • Enter Edit • Esc Close ");
-        f.render_widget(
-            Paragraph::new(hint)
-                .style(Style::default().fg(Color::Yellow))
-                .alignment(Alignment::Center)
-                .block(hint_block),
-            inner[1],
-        );
+        f.render_widget(List::new(items).block(block), modal);
     }
 }
 

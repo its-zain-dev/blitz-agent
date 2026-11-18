@@ -171,3 +171,33 @@ async fn interpolates_stdout_in_predicted_children() {
         "Info: KERNEL_42\n"
     );
 }
+
+#[tokio::test]
+async fn after_all_joins_parallel_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = plan(
+        r#"{
+            "steps": [
+                {"id": "a", "tool": "bash", "args": {"cmd": "echo ALPHA"}},
+                {"id": "b", "tool": "bash", "args": {"cmd": "echo BETA"}}
+            ],
+            "after_all": [
+                {"when": {"success": true}, "then": [
+                    {"id": "join", "tool": "write_file",
+                     "args": {"path": "joined.txt", "content": "{{stdout:a}}+{{stdout:b}}"},
+                     "predict": [{"when": {"success": true}, "then": [], "finish": "joined={{stdout:a}}+{{stdout:b}}"}]}
+                ]}
+            ]
+        }"#,
+    );
+    let r = executor(dir.path(), 8)
+        .run_with_after_all(&p.steps, &p.after_all)
+        .await;
+    assert!(r.clean());
+    assert_eq!(r.tool_calls(), 3);
+    assert_eq!(r.finish.as_deref(), Some("joined=ALPHA+BETA"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("joined.txt")).unwrap(),
+        "ALPHA+BETA"
+    );
+}

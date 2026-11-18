@@ -3,6 +3,8 @@
 //! * All top-level steps run concurrently (bounded by a semaphore).
 //! * When a step finishes, its predicted branches are checked in order; the first
 //!   match spawns that branch's `then` nodes concurrently – no LLM round trip.
+//! * Once all top-level steps finish, optional `after_all` join branches can spawn
+//!   follow-up steps that combine outputs from any of the parallel steps.
 //! * Predicted child nodes can reference parent/earlier outputs via `{{stdout:id}}`,
 //!   `{{stderr:id}}`, and `{{exit:id}}` placeholders in any string argument.
 
@@ -13,7 +15,7 @@ use futures::future::{join_all, BoxFuture, FutureExt};
 use serde_json::Value;
 use tokio::sync::{mpsc, Semaphore};
 
-use crate::plan::Node;
+use crate::plan::{Branch, Node};
 use crate::tools::{ToolBox, ToolOutput};
 use crate::util::{truncate_chars, truncate_middle};
 
@@ -91,9 +93,11 @@ fn interpolate_args(val: &Value, records: &[NodeRecord]) -> Value {
             }
             Value::String(out)
         }
-        Value::Array(arr) => {
-            Value::Array(arr.iter().map(|v| interpolate_args(v, records)).collect())
-        }
+        Value::Array(arr) => Value::Array(
+            arr.iter()
+                .map(|v| interpolate_args(v, records))
+                .collect(),
+        ),
         Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(k, v)| (k.clone(), interpolate_args(v, records)))
@@ -126,6 +130,11 @@ impl Executor {
 
     /// Execute a set of top-level steps (and every predicted branch that hits).
     pub async fn run(&self, steps: &[Node]) -> ExecReport {
+        self.run_with_after_all(steps, &[]).await
+    }
+
+    /// Execute top-level steps in parallel, then evaluate `after_all` join branches.
+    pub async fn run_with_after_all(&self, steps: &[Node], after_all: &[Branch]) -> ExecReport {
         let start = Instant::now();
         let shared = Arc::new(Mutex::new(Shared::default()));
         let futs: Vec<_> = steps
@@ -134,6 +143,61 @@ impl Executor {
             .map(|n| self.clone().run_node(n, None, 0, Arc::clone(&shared)))
             .collect();
         join_all(futs).await;
+
+        if !after_all.is_empty() {
+            let synthetic = {
+                let s = shared.lock().unwrap();
+                let all_ok = s.records.iter().all(|r| r.output.success());
+                let combined_stdout = s
+                    .records
+                    .iter()
+                    .map(|r| r.output.stdout.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let combined_stderr = s
+                    .records
+                    .iter()
+                    .map(|r| r.output.stderr.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ToolOutput {
+                    exit_code: if all_ok { 0 } else { 1 },
+                    stdout: combined_stdout,
+                    stderr: combined_stderr,
+                    duration_ms: 0,
+                }
+            };
+
+            let mut join_children: Vec<Node> = Vec::new();
+            for b in after_all {
+                if b.when.eval(&synthetic) {
+                    if let Some(f) = &b.finish {
+                        let mut s = shared.lock().unwrap();
+                        if s.finish.is_none() {
+                            let interpolated =
+                                match interpolate_args(&Value::String(f.clone()), &s.records) {
+                                    Value::String(st) => st,
+                                    _ => f.clone(),
+                                };
+                            s.finish = Some(interpolated);
+                        }
+                    }
+                    join_children = b.then.clone();
+                    break;
+                }
+            }
+            if !join_children.is_empty() {
+                let jfuts: Vec<_> = join_children
+                    .into_iter()
+                    .map(|c| {
+                        self.clone()
+                            .run_node(c, Some("all".into()), 1, Arc::clone(&shared))
+                    })
+                    .collect();
+                join_all(jfuts).await;
+            }
+        }
+
         let s = std::mem::take(&mut *shared.lock().unwrap());
         ExecReport {
             records: s.records,
@@ -193,8 +257,8 @@ impl Executor {
                                     _ => f.clone(),
                                 };
                             let stdout_self = format!("{{{{stdout:{}}}}}", node.id);
-                            let final_f =
-                                interpolated_finish.replace(&stdout_self, output.stdout.trim_end());
+                            let final_f = interpolated_finish
+                                .replace(&stdout_self, output.stdout.trim_end());
                             s.finish = Some(final_f);
                         }
                     }

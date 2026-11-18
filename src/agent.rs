@@ -248,7 +248,9 @@ impl Agent {
                 self.exec.clone()
             };
 
-            let report = exec.run(&plan.steps).await;
+            let report = exec
+                .run_with_after_all(&plan.steps, &plan.after_all)
+                .await;
             stats.tool_calls += report.tool_calls();
             stats.chained += report.chained();
             stats.hits += report.hits();
